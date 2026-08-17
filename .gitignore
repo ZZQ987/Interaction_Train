@@ -1,0 +1,4 @@
+minicpmo_runs/
+modeling_minicpmo.py
+__pycache__/
+*.py[cod]
