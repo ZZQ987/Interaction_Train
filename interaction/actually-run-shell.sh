@@ -1,6 +1,24 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+GPU_STRESS_TEST_SCRIPT=${GPU_STRESS_TEST_SCRIPT-"/mnt/shared-storage-user/leihaodi/gpu_stress_test.py"}
+RUN_GPU_STRESS_TEST_ON_EXIT=${RUN_GPU_STRESS_TEST_ON_EXIT:-True}
+run_gpu_stress_test_on_exit() {
+    local script_exit_code=$?
+    set +e
+    if [ "${RUN_GPU_STRESS_TEST_ON_EXIT:-True}" = "True" ] && [ -n "${GPU_STRESS_TEST_SCRIPT:-}" ]; then
+        echo "[cleanup] Running GPU_STRESS_TEST_SCRIPT before exiting..."
+        python3 "${GPU_STRESS_TEST_SCRIPT}"
+        local stress_exit_code=$?
+        if [ ${stress_exit_code} -ne 0 ]; then
+            echo "[cleanup] GPU_STRESS_TEST_SCRIPT failed with exit code ${stress_exit_code}"
+        fi
+    fi
+    trap - EXIT
+    exit ${script_exit_code}
+}
+trap run_gpu_stress_test_on_exit EXIT
+
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/.." &>/dev/null && pwd)"
 
@@ -34,6 +52,16 @@ REQUESTED_OUTPUT_DIR="${OUTPUT_DIR_OVERRIDE:-${OUTPUT_DIR-}}"
 MAX_CKPT_LIMIT="${MAX_CKPT_LIMIT:-3}"
 NO_EVAL="${NO_EVAL:-0}"
 EVAL_ONLY="${EVAL_ONLY:-0}"
+EVAL_SAVE_MODEL_TEXT="${EVAL_SAVE_MODEL_TEXT:-0}"
+EVAL_MAX_NEW_SPEAK_TOKENS="${EVAL_MAX_NEW_SPEAK_TOKENS:-128}"
+SAVE_BEST_TRAJECTORY_CHECKPOINT="${SAVE_BEST_TRAJECTORY_CHECKPOINT:-0}"
+WANDB_API_KEY="${WANDB_API_KEY:-2abfc7b9f957a374a4c015e7e048feff9ae0bc4e}" #leihaodi's api key
+DATASET_MODE="${DATASET_MODE:-generated}"
+SPOKENWOZ_AUDIO_CHUNK_SECONDS="${SPOKENWOZ_AUDIO_CHUNK_SECONDS:-1.0}"
+SPOKENWOZ_SAMPLING_RATE="${SPOKENWOZ_SAMPLING_RATE:-16000}"
+SPOKENWOZ_TRAIN_PARQUET_PREFIX="${SPOKENWOZ_TRAIN_PARQUET_PREFIX:-train}"
+SPOKENWOZ_EVAL_PARQUET_PREFIX="${SPOKENWOZ_EVAL_PARQUET_PREFIX:-dev}"
+PYARROW_SITE_PACKAGES="${PYARROW_SITE_PACKAGES:-}"
 if [[ "${EVAL_ONLY}" == "1" && "${NO_EVAL}" == "1" ]]; then
   echo "EVAL_ONLY=1 requires NO_EVAL=0 (${CONFIG_FILE})" >&2
   exit 2
@@ -46,7 +74,9 @@ CONFIG_VARS=(
   RJOB_NAME_PREFIX WANDB_MODE NCCL_DEBUG NCCL_IB_DISABLE
   TORCH_NCCL_ASYNC_ERROR_HANDLING PYTORCH_ALLOC_CONF
   PYTORCH_CUDA_ALLOC_CONF TRAIN_ENV_PREFIX HF_HOME MODEL TOKENIZER_MODEL
-  PROCESSOR_MODEL SOURCE_ROOT TRAIN_DATA EVAL_DATA OUTPUT_NAME_PREFIX
+  PROCESSOR_MODEL SOURCE_ROOT TRAIN_DATA EVAL_DATA OUTPUT_NAME_PREFIX DATASET_MODE
+  SPOKENWOZ_AUDIO_CHUNK_SECONDS SPOKENWOZ_SAMPLING_RATE
+  SPOKENWOZ_TRAIN_PARQUET_PREFIX SPOKENWOZ_EVAL_PARQUET_PREFIX PYARROW_SITE_PACKAGES
   INPUT_SCHEMA MAX_LENGTH BATCH_SIZE EVAL_BATCH_SIZE GRAD_ACCUM_STEPS EPOCHS
   LEARNING_RATE WEIGHT_DECAY GRADIENT_CHECKPOINTING NO_SAVE_CHECKPOINTS
   MAX_SLICE_NUMS MAX_IMAGE_PIXELS FORCE_IMAGE_SIZE IMAGE_SCALE_RESOLUTION
@@ -63,6 +93,7 @@ CONFIG_VARS=(
   CLEAN_EVENT_GROUNDING_TEMPLATES LISTEN_WEIGHT SPEAK_WEIGHT
   SPEAK_BOUNDARY_WEIGHT DELEGATE_WEIGHT MAX_TRAIN_BATCHES
   NO_EVAL EVAL_ONLY EVAL_BEFORE_TRAIN EVAL_EVERY_STEPS EVAL_SAVE_PREDICTIONS_LIMIT
+  EVAL_SAVE_MODEL_TEXT EVAL_MAX_NEW_SPEAK_TOKENS SAVE_BEST_TRAJECTORY_CHECKPOINT
   SPEAK_THRESHOLD_SWEEP SAVE_EVERY_STEPS LOG_EVERY MAX_EVAL_BATCHES
   KEEP_ALIVE
 )
@@ -72,6 +103,14 @@ for name in "${CONFIG_VARS[@]}"; do
     exit 2
   fi
 done
+
+case "${DATASET_MODE}" in
+  generated|spokenwoz) ;;
+  *)
+    echo "Invalid DATASET_MODE: ${DATASET_MODE}; expected generated or spokenwoz (${CONFIG_FILE})" >&2
+    exit 2
+    ;;
+esac
 
 case "${RJOB_TASK_TYPE}" in
   normal|idle) ;;
@@ -165,7 +204,7 @@ cd "${CODE_DIR}"
 
 export NNODES NPROC_PER_NODE MASTER_PORT
 export PYTHONUNBUFFERED=1
-export WANDB_MODE NCCL_DEBUG NCCL_IB_DISABLE TORCH_NCCL_ASYNC_ERROR_HANDLING
+export WANDB_MODE WANDB_DIR WANDB_API_KEY NCCL_DEBUG NCCL_IB_DISABLE TORCH_NCCL_ASYNC_ERROR_HANDLING
 export PYTORCH_ALLOC_CONF PYTORCH_CUDA_ALLOC_CONF HF_HOME
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
@@ -185,6 +224,8 @@ echo "[minicpmo_generated_rjob] NNODES=${NNODES} NODE_RANK=${NODE_RANK} NPROC_PE
 echo "[minicpmo_generated_rjob] MASTER_ADDR=${MASTER_ADDR} MASTER_PORT=${MASTER_PORT}"
 echo "[minicpmo_generated_rjob] MAX_LENGTH=${MAX_LENGTH} BATCH_SIZE=${BATCH_SIZE} GRAD_ACCUM_STEPS=${GRAD_ACCUM_STEPS}"
 echo "[minicpmo_generated_rjob] INPUT_SCHEMA=${INPUT_SCHEMA}"
+echo "[minicpmo_generated_rjob] DATASET_MODE=${DATASET_MODE}"
+echo "[minicpmo_generated_rjob] SPOKENWOZ_TRAIN_PARQUET_PREFIX=${SPOKENWOZ_TRAIN_PARQUET_PREFIX} SPOKENWOZ_EVAL_PARQUET_PREFIX=${SPOKENWOZ_EVAL_PARQUET_PREFIX}"
 echo "[minicpmo_generated_rjob] MAX_IMAGE_PIXELS=${MAX_IMAGE_PIXELS}"
 echo "[minicpmo_generated_rjob] FORCE_IMAGE_SIZE=${FORCE_IMAGE_SIZE}"
 echo "[minicpmo_generated_rjob] IMAGE_SCALE_RESOLUTION=${IMAGE_SCALE_RESOLUTION}"
@@ -194,6 +235,7 @@ echo "[minicpmo_generated_rjob] TRAIN_DATA=${TRAIN_DATA} EVAL_DATA=${EVAL_DATA}"
 echo "[minicpmo_generated_rjob] NO_EVAL=${NO_EVAL} EVAL_ONLY=${EVAL_ONLY} EVAL_EVERY_STEPS=${EVAL_EVERY_STEPS} MAX_EVAL_BATCHES=${MAX_EVAL_BATCHES}"
 echo "[minicpmo_generated_rjob] SAVE_EVERY_STEPS=${SAVE_EVERY_STEPS}"
 echo "[minicpmo_generated_rjob] MAX_CKPT_LIMIT=${MAX_CKPT_LIMIT}"
+echo "[minicpmo_generated_rjob] SAVE_BEST_TRAJECTORY_CHECKPOINT=${SAVE_BEST_TRAJECTORY_CHECKPOINT}"
 echo "[minicpmo_generated_rjob] TRAJECTORY_MAX_TURNS=${TRAJECTORY_MAX_TURNS} TRAJECTORY_CHUNK_STRIDE=${TRAJECTORY_CHUNK_STRIDE} GENERATED_MAX_IMAGES_PER_TURN=${GENERATED_MAX_IMAGES_PER_TURN}"
 echo "[minicpmo_generated_rjob] EVAL_TRAJECTORY_MAX_TURNS=${EVAL_TRAJECTORY_MAX_TURNS} EVAL_TRAJECTORY_CHUNK_STRIDE=${EVAL_TRAJECTORY_CHUNK_STRIDE}"
 echo "[minicpmo_generated_rjob] TRAIN_EXCLUDE_TASK_TYPES=${TRAIN_EXCLUDE_TASK_TYPES}"
@@ -209,21 +251,52 @@ echo "[minicpmo_generated_rjob] CLEAN_EVENT_GROUNDING_TEMPLATES=${CLEAN_EVENT_GR
 echo "[minicpmo_generated_rjob] SOURCE_ROOT=${SOURCE_ROOT}"
 echo "[minicpmo_generated_rjob] OUTPUT_DIR=${OUTPUT_DIR}"
 
-if [[ "${EVAL_ONLY}" != "1" && ! -s "${TRAIN_DATA}/manifest.jsonl" ]]; then
-  echo "Missing generated trajectory train manifest: ${TRAIN_DATA}/manifest.jsonl" >&2
-  exit 2
-fi
-if [[ -d "${EVAL_DATA}" ]]; then
-  if [[ ! -s "${EVAL_DATA}/manifest.jsonl" ]] && ! find "${EVAL_DATA}" -name '*.jsonl' -not -name '*.tmp' -print -quit | grep -q .; then
-    echo "Missing generated trajectory eval manifest/jsonl under: ${EVAL_DATA}" >&2
+if [[ "${DATASET_MODE}" == "spokenwoz" ]]; then
+  if [[ "${EVAL_ONLY}" != "1" ]] && ! {
+    [[ -f "${TRAIN_DATA}" && "$(basename -- "${TRAIN_DATA}")" == "${SPOKENWOZ_TRAIN_PARQUET_PREFIX}"*.parquet ]] ||
+      { [[ -d "${TRAIN_DATA}" ]] && find "${TRAIN_DATA}" -type f -name "${SPOKENWOZ_TRAIN_PARQUET_PREFIX}*.parquet" -print -quit | grep -q .; }
+  }; then
+    echo "No SpokenWOZ train parquet matching ${SPOKENWOZ_TRAIN_PARQUET_PREFIX}*.parquet under: ${TRAIN_DATA}" >&2
     exit 2
   fi
-elif [[ ! -s "${EVAL_DATA}" ]]; then
-  echo "Missing generated trajectory eval file: ${EVAL_DATA}" >&2
-  exit 2
+  if ! {
+    [[ -f "${EVAL_DATA}" && "$(basename -- "${EVAL_DATA}")" == "${SPOKENWOZ_EVAL_PARQUET_PREFIX}"*.parquet ]] ||
+      { [[ -d "${EVAL_DATA}" ]] && find "${EVAL_DATA}" -type f -name "${SPOKENWOZ_EVAL_PARQUET_PREFIX}*.parquet" -print -quit | grep -q .; }
+  }; then
+    echo "No SpokenWOZ eval parquet matching ${SPOKENWOZ_EVAL_PARQUET_PREFIX}*.parquet under: ${EVAL_DATA}" >&2
+    exit 2
+  fi
+else
+  if [[ "${EVAL_ONLY}" != "1" && ! -s "${TRAIN_DATA}/manifest.jsonl" ]]; then
+    echo "Missing generated trajectory train manifest: ${TRAIN_DATA}/manifest.jsonl" >&2
+    exit 2
+  fi
+  if [[ -d "${EVAL_DATA}" ]]; then
+    if [[ ! -s "${EVAL_DATA}/manifest.jsonl" ]] && ! find "${EVAL_DATA}" -name '*.jsonl' -not -name '*.tmp' -print -quit | grep -q .; then
+      echo "Missing generated trajectory eval manifest/jsonl under: ${EVAL_DATA}" >&2
+      exit 2
+    fi
+  elif [[ ! -s "${EVAL_DATA}" ]]; then
+    echo "Missing generated trajectory eval file: ${EVAL_DATA}" >&2
+    exit 2
+  fi
 fi
 
 extra_args=()
+if [[ "${DATASET_MODE}" == "spokenwoz" ]]; then
+  extra_args+=(
+    --spokenwoz-mode
+    --spokenwoz-audio-chunk-seconds "${SPOKENWOZ_AUDIO_CHUNK_SECONDS}"
+    --spokenwoz-sampling-rate "${SPOKENWOZ_SAMPLING_RATE}"
+    --spokenwoz-train-parquet-prefix "${SPOKENWOZ_TRAIN_PARQUET_PREFIX}"
+    --spokenwoz-eval-parquet-prefix "${SPOKENWOZ_EVAL_PARQUET_PREFIX}"
+  )
+  if [[ -n "${PYARROW_SITE_PACKAGES}" ]]; then
+    extra_args+=(--pyarrow-site-packages "${PYARROW_SITE_PACKAGES}")
+  fi
+else
+  extra_args+=(--generated-trajectory-mode)
+fi
 if [[ -n "${ATTN_IMPLEMENTATION}" ]]; then
   extra_args+=(--attn-implementation "${ATTN_IMPLEMENTATION}")
 fi
@@ -259,6 +332,12 @@ if [[ "${NO_EVAL}" == "1" ]]; then
 fi
 if [[ "${EVAL_ONLY}" == "1" ]]; then
   extra_args+=(--eval-only)
+fi
+if [[ "${EVAL_SAVE_MODEL_TEXT}" == "1" ]]; then
+  extra_args+=(--eval-save-model-text)
+fi
+if [[ "${SAVE_BEST_TRAJECTORY_CHECKPOINT}" == "1" ]]; then
+  extra_args+=(--save-best-trajectory-checkpoint)
 fi
 
 "${TRAIN_ENV_PREFIX}/bin/python" -c 'import flash_attn, torch; print(f"flash_attn={flash_attn.__version__} torch={torch.__version__}")'
@@ -298,11 +377,11 @@ fi
   --max-train-batches "${MAX_TRAIN_BATCHES}" \
   --eval-every-steps "${EVAL_EVERY_STEPS}" \
   --eval-save-predictions-limit "${EVAL_SAVE_PREDICTIONS_LIMIT}" \
+  --eval-max-new-speak-tokens-per-chunk "${EVAL_MAX_NEW_SPEAK_TOKENS}" \
   --speak-threshold-sweep="${SPEAK_THRESHOLD_SWEEP}" \
   --save-every-steps "${SAVE_EVERY_STEPS}" \
   --max-ckpt-limit "${MAX_CKPT_LIMIT}" \
   --log-every "${LOG_EVERY}" \
-  --generated-trajectory-mode \
   --trajectory-max-turns "${TRAJECTORY_MAX_TURNS}" \
   --trajectory-chunk-stride "${TRAJECTORY_CHUNK_STRIDE}" \
   --eval-trajectory-max-turns "${EVAL_TRAJECTORY_MAX_TURNS}" \
@@ -352,6 +431,8 @@ echo "  train_data=${TRAIN_DATA}"
 echo "  eval_data=${EVAL_DATA}"
 echo "  max_length=${MAX_LENGTH} batch_size=${BATCH_SIZE} grad_accum_steps=${GRAD_ACCUM_STEPS}"
 echo "  input_schema=${INPUT_SCHEMA}"
+echo "  dataset_mode=${DATASET_MODE}"
+echo "  spokenwoz_train_parquet_prefix=${SPOKENWOZ_TRAIN_PARQUET_PREFIX} spokenwoz_eval_parquet_prefix=${SPOKENWOZ_EVAL_PARQUET_PREFIX}"
 echo "  eval_batch_size=${EVAL_BATCH_SIZE} eval_only=${EVAL_ONLY} eval_before_train=${EVAL_BEFORE_TRAIN} max_train_batches=${MAX_TRAIN_BATCHES}"
 echo "  max_image_pixels=${MAX_IMAGE_PIXELS}"
 echo "  force_image_size=${FORCE_IMAGE_SIZE}"
@@ -359,7 +440,10 @@ echo "  image_scale_resolution=${IMAGE_SCALE_RESOLUTION}"
 echo "  vision_batch_size=${VISION_BATCH_SIZE}"
 echo "  attn_implementation=${ATTN_IMPLEMENTATION}"
 echo "  eval_every_steps=${EVAL_EVERY_STEPS} max_eval_batches=${MAX_EVAL_BATCHES}"
+echo "  eval_save_model_text=${EVAL_SAVE_MODEL_TEXT}"
+echo "  eval_max_new_speak_tokens_per_chunk=${EVAL_MAX_NEW_SPEAK_TOKENS}"
 echo "  save_every_steps=${SAVE_EVERY_STEPS}"
+echo "  save_best_trajectory_checkpoint=${SAVE_BEST_TRAJECTORY_CHECKPOINT}"
 echo "  trajectory_max_turns=${TRAJECTORY_MAX_TURNS} trajectory_chunk_stride=${TRAJECTORY_CHUNK_STRIDE} generated_max_images_per_turn=${GENERATED_MAX_IMAGES_PER_TURN}"
 echo "  eval_trajectory_max_turns=${EVAL_TRAJECTORY_MAX_TURNS} eval_trajectory_chunk_stride=${EVAL_TRAJECTORY_CHUNK_STRIDE}"
 echo "  train_exclude_task_types=${TRAIN_EXCLUDE_TASK_TYPES} eval_exclude_task_types=${EVAL_EXCLUDE_TASK_TYPES}"
@@ -379,9 +463,11 @@ echo "  wandb_dir=${WANDB_DIR}"
 
 RJOB_ENV_VARS=(
   USER_ROOT CODE_DIR RUNS_ROOT TRAIN_ENV_PREFIX TRAIN_PYTHON_SCRIPT HF_HOME
-  WANDB_MODE NCCL_DEBUG NCCL_IB_DISABLE TORCH_NCCL_ASYNC_ERROR_HANDLING
+  WANDB_MODE WANDB_API_KEY NCCL_DEBUG NCCL_IB_DISABLE TORCH_NCCL_ASYNC_ERROR_HANDLING
   PYTORCH_ALLOC_CONF PYTORCH_CUDA_ALLOC_CONF
-  MODEL TOKENIZER_MODEL PROCESSOR_MODEL SOURCE_ROOT TRAIN_DATA EVAL_DATA
+  MODEL TOKENIZER_MODEL PROCESSOR_MODEL SOURCE_ROOT TRAIN_DATA EVAL_DATA DATASET_MODE
+  SPOKENWOZ_AUDIO_CHUNK_SECONDS SPOKENWOZ_SAMPLING_RATE
+  SPOKENWOZ_TRAIN_PARQUET_PREFIX SPOKENWOZ_EVAL_PARQUET_PREFIX PYARROW_SITE_PACKAGES
   OUTPUT_DIR OUTPUT_ROOT LOG_DIR WANDB_DIR INPUT_SCHEMA MAX_LENGTH MAX_IMAGE_PIXELS
   FORCE_IMAGE_SIZE IMAGE_SCALE_RESOLUTION VISION_BATCH_SIZE
   ATTN_IMPLEMENTATION BATCH_SIZE GRAD_ACCUM_STEPS EPOCHS LEARNING_RATE
@@ -398,6 +484,7 @@ RJOB_ENV_VARS=(
   CLEAN_EVENT_GROUNDING_TEMPLATES LISTEN_WEIGHT SPEAK_WEIGHT
   SPEAK_BOUNDARY_WEIGHT DELEGATE_WEIGHT EVAL_BATCH_SIZE MAX_TRAIN_BATCHES
   NO_EVAL EVAL_ONLY EVAL_BEFORE_TRAIN EVAL_EVERY_STEPS EVAL_SAVE_PREDICTIONS_LIMIT
+  EVAL_SAVE_MODEL_TEXT EVAL_MAX_NEW_SPEAK_TOKENS SAVE_BEST_TRAJECTORY_CHECKPOINT
   SPEAK_THRESHOLD_SWEEP SAVE_EVERY_STEPS GRADIENT_CHECKPOINTING
   NO_SAVE_CHECKPOINTS LOG_EVERY MAX_EVAL_BATCHES MAX_CKPT_LIMIT KEEP_ALIVE
 )
@@ -424,10 +511,11 @@ rjob submit --name="${RJOB_NAME}" \
   --private-machine=group \
   --mount=gpfs://gpfs1/p1-shared:/mnt/shared-storage-user/p1-shared \
   --mount=gpfs://gpfs1/cuiganqu:/mnt/shared-storage-user/cuiganqu \
+  --mount=gpfs://gpfs1/leihaodi:/mnt/shared-storage-user/leihaodi \
   --mount=gpfs://gpfs2/gpfs2-shared-public:/mnt/shared-storage-gpfs2/gpfs2-shared-public \
   --mount=gpfs://gpfs2/p1-shared-2:/mnt/shared-storage-gpfs2/p1-shared-2 \
   --image="${RJOB_IMAGE}" \
-  -P "${NODE_COUNT}" --host-network="${HOST_NETWORK}" \
+  -P "${NODE_COUNT}" --host-network="${HOST_NETWORK}" --priority 9 \
   -e DISTRIBUTED_JOB=true \
   -e GROUP="${RJOB_NAMESPACE}" \
   -e NNODES="${NODE_COUNT}" \

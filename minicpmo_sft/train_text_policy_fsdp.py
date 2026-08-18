@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import math
 import os
@@ -33,9 +34,16 @@ from minicpmo_dataset import (
     IGNORE_INDEX,
     MiniCPMOGeneratedTrajectoryDataset,
     MiniCPMOInteractionDataset,
+    MiniCPMOSpokenWozDuplexDataset,
     MiniCPMOTrajectoryDataset,
     MiniCPMODuplexTrajectoryCollator,
     MiniCPMODataCollator,
+)
+from spokenwoz_streaming_eval import (
+    build_response_episodes as _build_spokenwoz_response_episodes,
+    calculate_metrics as _calculate_spokenwoz_streaming_metrics,
+    evaluate_dialog as _evaluate_spokenwoz_dialog,
+    write_jsonl as _write_spokenwoz_jsonl,
 )
 
 
@@ -77,6 +85,85 @@ def _setup_dist() -> torch.device:
 def _cleanup_dist() -> None:
     if dist.is_initialized():
         dist.destroy_process_group()
+
+
+def _init_wandb(args: argparse.Namespace, output_dir: Path, logger: Any) -> Any:
+    """Initialize one W&B run on rank 0 without exposing credentials."""
+
+    if not _is_rank0():
+        return None
+    mode = str(os.environ.get("WANDB_MODE") or "offline").strip().lower()
+    os.environ["WANDB_MODE"] = mode
+    api_key_source = "environment" if os.environ.get("WANDB_API_KEY") else "missing"
+
+    wandb_dir = Path(os.environ.get("WANDB_DIR") or (output_dir / "wandb"))
+    wandb_dir.mkdir(parents=True, exist_ok=True)
+    os.environ["WANDB_DIR"] = str(wandb_dir)
+    for env_name, child_name in (
+        ("WANDB_CACHE_DIR", ".cache"),
+        ("WANDB_CONFIG_DIR", ".config"),
+        ("WANDB_DATA_DIR", ".data"),
+    ):
+        directory = Path(os.environ.get(env_name) or (wandb_dir / child_name))
+        directory.mkdir(parents=True, exist_ok=True)
+        os.environ[env_name] = str(directory)
+    project = str(os.environ.get("WANDB_PROJECT") or "minicpmo-interaction-train")
+    run_name = str(os.environ.get("WANDB_RUN_NAME") or wandb_dir.name or output_dir.name)
+    try:
+        import wandb
+
+        run = wandb.init(
+            project=project,
+            name=run_name,
+            dir=str(wandb_dir),
+            mode=mode,
+            config=vars(args),
+            job_type="eval" if args.eval_only else "train",
+        )
+        run.define_metric("global_step")
+        run.define_metric("train/*", step_metric="global_step")
+        run.define_metric("eval/*", step_metric="global_step")
+        run.define_metric("system/*", step_metric="global_step")
+        logger.info(
+            "wandb_initialized mode=%s project=%s run_name=%s dir=%s api_key_source=%s",
+            mode,
+            project,
+            run_name,
+            wandb_dir,
+            api_key_source,
+        )
+        return run
+    except Exception as exc:
+        logger.warning("wandb_initialization_failed error=%r; continuing without W&B", exc)
+        return None
+
+
+def _wandb_scalar_metrics(metrics: dict[str, Any], prefix: str) -> dict[str, int | float]:
+    payload: dict[str, int | float] = {}
+    for key, value in metrics.items():
+        if isinstance(value, bool):
+            payload[f"{prefix}/{key}"] = int(value)
+        elif isinstance(value, (int, float)):
+            payload[f"{prefix}/{key}"] = value
+    return payload
+
+
+def _wandb_log(run: Any, payload: dict[str, Any], global_step: int, logger: Any) -> None:
+    if run is None or not _is_rank0():
+        return
+    try:
+        run.log({"global_step": int(global_step), **payload})
+    except Exception as exc:
+        logger.warning("wandb_log_failed step=%d error=%r", global_step, exc)
+
+
+def _finish_wandb(run: Any, logger: Any) -> None:
+    if run is None or not _is_rank0():
+        return
+    try:
+        run.finish()
+    except Exception as exc:
+        logger.warning("wandb_finish_failed error=%r", exc)
 
 
 def _move_to_device(value: Any, device: torch.device) -> Any:
@@ -145,6 +232,330 @@ def _wrap_model_fsdp(model: torch.nn.Module, device: torch.device) -> FSDP:
         device_id=device,
         use_orig_params=True,
     )
+
+
+def _load_spokenwoz_streaming_eval_model(
+    model_path: str | os.PathLike[str],
+    *,
+    tokenizer_path: str | os.PathLike[str],
+    processor_path: str | os.PathLike[str],
+    audio_chunk_seconds: float,
+    attn_implementation: str,
+    logger: Any,
+) -> torch.nn.Module:
+    """Load the rank-local text-only duplex inference copy on CPU."""
+
+    from transformers import AutoModel, AutoProcessor, AutoTokenizer
+
+    load_kwargs: dict[str, Any] = {
+        "trust_remote_code": True,
+        "local_files_only": True,
+        "torch_dtype": torch.bfloat16,
+        "init_vision": False,
+        "init_audio": True,
+        "init_tts": False,
+        "low_cpu_mem_usage": True,
+    }
+    if attn_implementation:
+        load_kwargs["attn_implementation"] = attn_implementation
+    eval_model = AutoModel.from_pretrained(model_path, **load_kwargs)
+    eval_tokenizer = AutoTokenizer.from_pretrained(
+        tokenizer_path,
+        trust_remote_code=True,
+        local_files_only=True,
+    )
+    eval_processor = AutoProcessor.from_pretrained(
+        processor_path,
+        trust_remote_code=True,
+        local_files_only=True,
+    )
+    if not hasattr(eval_processor, "tokenizer") or eval_processor.tokenizer is None:
+        eval_processor.tokenizer = eval_tokenizer
+    eval_model.processor = eval_processor
+    eval_model.config.audio_chunk_length = float(audio_chunk_seconds)
+    eval_model.config.stream_input = True
+    eval_model.requires_grad_(False)
+    eval_model.eval()
+    logger.info(
+        "spokenwoz_streaming_eval_model_loaded rank=%d model=%s device=cpu "
+        "init_vision=false init_audio=true init_tts=false",
+        _rank(),
+        model_path,
+    )
+    return eval_model
+
+
+def _as_text_only_duplex(
+    eval_model: torch.nn.Module,
+    *,
+    device: torch.device,
+    audio_chunk_seconds: float,
+    sampling_rate: int,
+) -> Any:
+    """Construct upstream duplex mode while locally suppressing its stray TTS init."""
+
+    model_type = type(eval_model)
+    original_init_tts = getattr(model_type, "init_tts", None)
+    if original_init_tts is None:
+        raise AttributeError("MiniCPM-o eval model class has no init_tts method")
+
+    def _skip_init_tts(_self: Any, *_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    # Upstream from_existing_model() calls init_tts unconditionally even when
+    # generate_audio=False. Patch only this process-local class and restore it
+    # immediately after construction; no model source file is modified.
+    setattr(model_type, "init_tts", _skip_init_tts)
+    try:
+        duplex = eval_model.as_duplex(
+            device=str(device),
+            generate_audio=False,
+            chunk_ms=int(round(audio_chunk_seconds * 1000)),
+            first_chunk_ms=int(round(audio_chunk_seconds * 1000)) + 35,
+            sample_rate=int(sampling_rate),
+            force_listen_count=0,
+            sliding_window_mode="off",
+        )
+    finally:
+        setattr(model_type, "init_tts", original_init_tts)
+    return duplex
+
+
+def _copy_module_state(source: torch.nn.Module, target: torch.nn.Module) -> None:
+    """Strictly copy one module state without retaining source tensor clones."""
+
+    source_state = source.state_dict()
+    target.load_state_dict(source_state, strict=True)
+    del source_state
+
+
+@torch.no_grad()
+def _sync_fsdp_llm_to_eval_model(model: FSDP, eval_model: torch.nn.Module) -> None:
+    """Materialize current FSDP LLM weights on every rank and copy them to CPU."""
+
+    with FSDP.summon_full_params(
+        model,
+        recurse=True,
+        writeback=False,
+        rank0_only=False,
+        offload_to_cpu=False,
+        with_grads=False,
+    ):
+        training_root = model.module
+        _copy_module_state(training_root.llm, eval_model.llm)
+
+
+def _strided_dialog_indices(dialog_count: int, rank: int, world_size: int) -> list[int]:
+    """Return an unpadded rank shard in stable dataset order."""
+
+    if dialog_count < 0:
+        raise ValueError("dialog_count must be non-negative")
+    if world_size <= 0 or not 0 <= rank < world_size:
+        raise ValueError(f"invalid distributed shard rank={rank} world_size={world_size}")
+    return list(range(rank, dialog_count, world_size))
+
+
+def _merge_spokenwoz_rank_payloads(
+    payloads: Sequence[dict[str, Any]],
+    *,
+    dialog_ids: Sequence[str],
+) -> list[dict[str, Any]]:
+    """Validate complete one-owner dialog shards and return stable records."""
+
+    assigned_indices = [
+        int(dialog_index)
+        for payload in payloads
+        for dialog_index in payload.get("dialog_indices", [])
+    ]
+    expected_indices = list(range(len(dialog_ids)))
+    if sorted(assigned_indices) != expected_indices or len(assigned_indices) != len(
+        set(assigned_indices)
+    ):
+        raise RuntimeError(
+            "SpokenWOZ distributed eval dialog assignment has duplicates or omissions: "
+            f"assigned={sorted(assigned_indices)} expected={expected_indices}"
+        )
+
+    all_records = [
+        record for payload in payloads for record in payload.get("records", [])
+    ]
+    dialog_order = {str(wav_id): index for index, wav_id in enumerate(dialog_ids)}
+    observed_ids = {str(record["wav_id"]) for record in all_records}
+    missing_ids = [str(wav_id) for wav_id in dialog_ids if str(wav_id) not in observed_ids]
+    unexpected_ids = sorted(observed_ids - set(dialog_order))
+    if missing_ids or unexpected_ids:
+        raise RuntimeError(
+            "SpokenWOZ distributed eval records have missing/unexpected dialogs: "
+            f"missing={missing_ids} unexpected={unexpected_ids}"
+        )
+    all_records.sort(
+        key=lambda record: (
+            dialog_order[str(record["wav_id"])],
+            int(record["turn_index"]),
+        )
+    )
+    return all_records
+
+
+def _clear_spokenwoz_duplex_cache(duplex: Any, eval_model: torch.nn.Module) -> None:
+    """Drop rank-local streaming KV/audio state before returning the model to CPU."""
+
+    decoder = getattr(duplex, "decoder", None)
+    if decoder is not None and hasattr(decoder, "reset"):
+        decoder.reset()
+    if hasattr(duplex, "_reset_streaming_state"):
+        duplex._reset_streaming_state()
+    if hasattr(eval_model, "reset_session"):
+        try:
+            eval_model.reset_session(reset_token2wav_cache=True)
+        except TypeError:
+            eval_model.reset_session()
+    eval_processor = getattr(eval_model, "processor", None)
+    if eval_processor is not None and hasattr(eval_processor, "reset_streaming"):
+        eval_processor.reset_streaming()
+    for name in (
+        "llm_past_key_values",
+        "audio_past_key_values",
+        "tts_past_key_values",
+        "_speculative_snapshot",
+    ):
+        if hasattr(eval_model, name):
+            setattr(eval_model, name, None)
+
+
+@torch.no_grad()
+def _evaluate_spokenwoz_streaming(
+    model: FSDP,
+    eval_model: torch.nn.Module,
+    dataset: Any,
+    device: torch.device,
+    max_eval_dialogs: int,
+    *,
+    prediction_output: Path,
+    eval_name: str,
+    max_new_speak_tokens_per_chunk: int,
+    audio_chunk_seconds: float,
+    sampling_rate: int,
+    logger: Any,
+) -> dict[str, Any]:
+    """Run real rank-local generation, then gather and score on rank 0."""
+
+    was_training = bool(model.training)
+    dialog_count = len(dataset)
+    if max_eval_dialogs > 0:
+        dialog_count = min(dialog_count, max_eval_dialogs)
+    selected_dialog_ids = [str(dataset.dialog_ids[index]) for index in range(dialog_count)]
+    local_indices = _strided_dialog_indices(dialog_count, _rank(), _world_size())
+    local_records: list[dict[str, Any]] = []
+    duplex = None
+    started = time.monotonic()
+
+    # This is the only generation-time collective: all ranks first materialize
+    # and copy current LLM weights. Dialog generation below is fully independent.
+    _sync_fsdp_llm_to_eval_model(model, eval_model)
+    try:
+        eval_model.to(device)
+        eval_model.eval()
+        duplex = _as_text_only_duplex(
+            eval_model,
+            device=device,
+            audio_chunk_seconds=audio_chunk_seconds,
+            sampling_rate=sampling_rate,
+        )
+        logger.info(
+            "spokenwoz_streaming_eval_start name=%s rank=%d dialogs=%d indices=%s "
+            "decode=greedy max_new_speak_tokens_per_chunk=%d generate_audio=false",
+            eval_name,
+            _rank(),
+            len(local_indices),
+            json.dumps(local_indices),
+            max_new_speak_tokens_per_chunk,
+        )
+        for local_position, dialog_index in enumerate(local_indices, start=1):
+            dialog = dataset[dialog_index]
+            local_records.extend(
+                _evaluate_spokenwoz_dialog(
+                    duplex,
+                    dialog,
+                    max_new_speak_tokens_per_chunk=max_new_speak_tokens_per_chunk,
+                    decode_mode="greedy",
+                    listen_prob_scale=1.0,
+                    prompt_wav_path=None,
+                    audio_writer=None,
+                    logger=logger,
+                )
+            )
+            logger.info(
+                "spokenwoz_streaming_dialog_done name=%s rank=%d position=%d/%d "
+                "dataset_index=%d wav_id=%s",
+                eval_name,
+                _rank(),
+                local_position,
+                len(local_indices),
+                dialog_index,
+                dialog["wav_id"],
+            )
+    finally:
+        if duplex is not None:
+            _clear_spokenwoz_duplex_cache(duplex, eval_model)
+            del duplex
+        eval_model.to("cpu")
+        gc.collect()
+        torch.cuda.empty_cache()
+        model.train(was_training)
+
+    local_payload = {
+        "rank": _rank(),
+        "dialog_indices": local_indices,
+        "records": local_records,
+    }
+    gathered_payloads: list[dict[str, Any] | None] | None = (
+        [None for _ in range(_world_size())] if _is_rank0() else None
+    )
+    dist.gather_object(local_payload, gathered_payloads, dst=0)
+
+    metrics_payload: list[dict[str, Any] | None] = [None]
+    if _is_rank0():
+        assert gathered_payloads is not None
+        rank_payloads = [payload for payload in gathered_payloads if payload is not None]
+        if len(rank_payloads) != _world_size():
+            raise RuntimeError(
+                f"received {len(rank_payloads)} SpokenWOZ eval payloads from {_world_size()} ranks"
+            )
+        all_records = _merge_spokenwoz_rank_payloads(
+            rank_payloads,
+            dialog_ids=selected_dialog_ids,
+        )
+        episodes = _build_spokenwoz_response_episodes(all_records)
+        prediction_output.parent.mkdir(parents=True, exist_ok=True)
+        episodes_output = prediction_output.with_suffix(".episodes.jsonl")
+        _write_spokenwoz_jsonl(prediction_output, all_records)
+        _write_spokenwoz_jsonl(episodes_output, episodes)
+        result = _calculate_spokenwoz_streaming_metrics(all_records)
+        result.update(
+            {
+                "eval_name": eval_name,
+                "selected_dialogs": dialog_count,
+                "completed_dialogs": len(selected_dialog_ids),
+                "prediction_output": str(prediction_output),
+                "episodes_output": str(episodes_output),
+                "decode_mode": "greedy",
+                "generate_audio": False,
+                "max_new_speak_tokens_per_chunk": max_new_speak_tokens_per_chunk,
+                "elapsed_seconds": time.monotonic() - started,
+            }
+        )
+        if result["n_tts_tokens"] != 0 or result["tts_audio_files"] != 0:
+            raise RuntimeError(
+                "text-only SpokenWOZ eval unexpectedly produced TTS tokens or audio files"
+            )
+        metrics_payload[0] = result
+
+    dist.broadcast_object_list(metrics_payload, src=0)
+    result = metrics_payload[0]
+    if result is None:
+        raise RuntimeError("rank 0 did not broadcast SpokenWOZ streaming metrics")
+    return result
 
 
 class BinaryRatioDistributedSampler(Sampler[int]):
@@ -355,6 +766,46 @@ def _marker_ids(tokenizer: Any, text: str) -> list[int]:
         return [int(x) for x in tokenizer.encode(text, add_special_tokens=False)]
     except TypeError:
         return [int(x) for x in tokenizer.encode(text)]
+
+
+def _decode_model_text_logits(
+    logits: torch.Tensor,
+    tokenizer: Any,
+    *,
+    row_idx: int,
+    start_pos: int,
+    end_pos: int,
+) -> str | None:
+    """Decode argmax tokens over the teacher-forced agent-text label span."""
+
+    if row_idx < 0 or row_idx >= logits.shape[0]:
+        return None
+    if start_pos < 0 or end_pos < start_pos or end_pos > logits.shape[1]:
+        return None
+    token_ids = torch.argmax(logits[row_idx, start_pos:end_pos], dim=-1).tolist()
+    if not token_ids:
+        return ""
+    stop_ids: set[int] = set()
+    for marker in ("<|turn_eos|>", "<|chunk_eos|>", "</unit>", "<|im_end|>"):
+        stop_ids.update(_marker_ids(tokenizer, marker))
+    eos_id = getattr(tokenizer, "eos_token_id", None)
+    if eos_id is not None:
+        stop_ids.add(int(eos_id))
+    kept_ids = []
+    for token_id in token_ids:
+        if int(token_id) in stop_ids:
+            break
+        kept_ids.append(int(token_id))
+    try:
+        return str(
+            tokenizer.decode(
+                kept_ids,
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=False,
+            )
+        ).strip()
+    except TypeError:
+        return str(tokenizer.decode(kept_ids, skip_special_tokens=True)).strip()
 
 
 def _safe_rate(numerator: int, denominator: int) -> float:
@@ -723,6 +1174,7 @@ def _evaluate(
     prediction_limit: int = 0,
     eval_name: str = "eval",
     speak_threshold_sweep: Sequence[float] = (),
+    save_model_text: bool = False,
 ) -> dict[str, Any]:
     model.eval()
     loss_sum = torch.zeros(1, device=device)
@@ -869,6 +1321,15 @@ def _evaluate(
                 task_counter["correct"] += 1
                 task_counter[f"{gold_action}_correct"] += 1
             if pred_handle is not None and (prediction_limit <= 0 or local_predictions_written < prediction_limit):
+                model_text = None
+                if save_model_text and pred_action == "speak":
+                    model_text = _decode_model_text_logits(
+                        outputs.logits,
+                        tokenizer,
+                        row_idx=row_idx,
+                        start_pos=int(record.get("model_text_label_start", -1)),
+                        end_pos=int(record.get("model_text_label_end", -1)),
+                    )
                 pred_handle.write(
                     json.dumps(
                         {
@@ -881,6 +1342,13 @@ def _evaluate(
                             "turn_index": record.get("turn_index"),
                             "local_turn_index": record.get("local_turn_index", record.get("turn_index")),
                             "original_turn_index": record.get("original_turn_index", record.get("turn_index")),
+                            "source_turn_index": record.get("source_turn_index"),
+                            "audio_chunk_index": record.get("audio_chunk_index"),
+                            "audio_chunk_count": record.get("audio_chunk_count"),
+                            "valid_audio_samples": record.get("valid_audio_samples"),
+                            "padded_audio_samples": record.get("padded_audio_samples"),
+                            "domains": record.get("domains"),
+                            "slots": record.get("slots"),
                             "target_time": record.get("target_time"),
                             "gold_action": gold_action,
                             "pred_action": pred_action,
@@ -889,6 +1357,7 @@ def _evaluate(
                             "delegate_label_pos": delegate_label_pos,
                             "delegate_predicted": delegate_predicted,
                             "gold_text": record.get("gold_text"),
+                            "model_text": model_text,
                             "speak_segment_start": record.get("speak_segment_start"),
                             "speak_segment_end": record.get("speak_segment_end"),
                             "speak_segment_text": record.get("speak_segment_text"),
@@ -1166,6 +1635,7 @@ def _evaluate(
             else None
         ),
         "prediction_records_written_local": local_predictions_written,
+        "model_text_enabled": bool(save_model_text),
     }
     if sweep_metrics:
         result["speak_threshold_sweep"] = sweep_metrics
@@ -1175,6 +1645,89 @@ def _evaluate(
         result["speak_threshold_best_recall"] = best_sweep.get("speak_recall")
         result["speak_threshold_best_pred_speak"] = best_sweep.get("pred_speak")
     return result
+
+
+def _run_evaluation(
+    *,
+    args: argparse.Namespace,
+    model: FSDP,
+    spokenwoz_eval_model: torch.nn.Module | None,
+    eval_dataset: Any,
+    eval_loader: DataLoader | None,
+    device: torch.device,
+    tokenizer: Any,
+    prediction_output: Path,
+    eval_name: str,
+    speak_threshold_sweep: Sequence[float],
+    logger: Any,
+) -> dict[str, Any]:
+    if args.spokenwoz_mode:
+        if spokenwoz_eval_model is None:
+            raise RuntimeError("SpokenWOZ streaming eval model was not initialized")
+        return _evaluate_spokenwoz_streaming(
+            model,
+            spokenwoz_eval_model,
+            eval_dataset,
+            device,
+            args.max_eval_batches,
+            prediction_output=prediction_output,
+            eval_name=eval_name,
+            max_new_speak_tokens_per_chunk=args.eval_max_new_speak_tokens_per_chunk,
+            audio_chunk_seconds=args.spokenwoz_audio_chunk_seconds,
+            sampling_rate=args.spokenwoz_sampling_rate,
+            logger=logger,
+        )
+    if eval_loader is None:
+        raise RuntimeError("teacher-forced eval loader was not initialized")
+    return _evaluate(
+        model,
+        eval_loader,
+        device,
+        args.max_eval_batches,
+        tokenizer=tokenizer,
+        prediction_output=prediction_output,
+        prediction_limit=args.eval_save_predictions_limit,
+        eval_name=eval_name,
+        speak_threshold_sweep=speak_threshold_sweep,
+        save_model_text=args.eval_save_model_text,
+    )
+
+
+def _log_spokenwoz_eval_summary(
+    logger: Any,
+    *,
+    phase: str,
+    metrics: dict[str, Any],
+    global_step: int,
+) -> None:
+    logger.info(
+        "%s step=%d schema=%s raw_gold=%d idle_points=%d continuation_points=%d "
+        "speak_recall=%.6f (%d/%d) false_speak_rate=%.6f (%d/%d) "
+        "trajectory_acc=%.6f (%d/%d) episodes=%d complete=%d incomplete=%d "
+        "n_model_tokens=%d n_tts_tokens=%d pred_file=%s episodes_file=%s",
+        phase,
+        global_step,
+        metrics["evaluation_schema"],
+        metrics["raw_gold_points"],
+        metrics["scorable_idle_points"],
+        metrics["continuation_points"],
+        metrics["speak_recall"],
+        metrics["should_speak_predicted_speak"],
+        metrics["should_speak_points"],
+        metrics["false_speak_rate"],
+        metrics["should_listen_predicted_speak"],
+        metrics["should_listen_points"],
+        metrics["trajectory_acc"],
+        metrics["trajectory_correct"],
+        metrics["trajectory_total"],
+        metrics["response_episode_count"],
+        metrics["complete_response_episodes"],
+        metrics["incomplete_response_episodes"],
+        metrics["n_model_tokens"],
+        metrics["n_tts_tokens"],
+        metrics["prediction_output"],
+        metrics["episodes_output"],
+    )
 
 
 def _save_checkpoint(
@@ -1300,6 +1853,11 @@ def _resume_config(args: argparse.Namespace) -> dict[str, Any]:
         "seed",
         "trajectory_mode",
         "generated_trajectory_mode",
+        "spokenwoz_mode",
+        "spokenwoz_audio_chunk_seconds",
+        "spokenwoz_sampling_rate",
+        "spokenwoz_train_parquet_prefix",
+        "spokenwoz_eval_parquet_prefix",
         "trajectory_max_turns",
         "trajectory_chunk_stride",
         "trajectory_drop_single_turn",
@@ -1417,13 +1975,35 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=20260726)
     parser.add_argument("--log-every", type=int, default=50, help="Log training progress every N optimizer steps.")
     parser.add_argument("--eval-batch-size", type=int, default=1)
-    parser.add_argument("--max-eval-batches", type=int, default=0)
+    parser.add_argument(
+        "--max-eval-batches",
+        type=int,
+        default=0,
+        help=(
+            "Teacher-forced eval batch limit; in --spokenwoz-mode this is the global "
+            "maximum number of dev dialogs. 0 evaluates all data."
+        ),
+    )
     parser.add_argument("--max-train-batches", type=int, default=0)
     parser.add_argument("--no-eval", action="store_true", help="Disable initial, periodic, and end-of-epoch evaluation.")
     parser.add_argument("--eval-only", action="store_true", help="Run one evaluation pass and exit without training or saving a checkpoint.")
     parser.add_argument("--eval-every-steps", type=int, default=0, help="Run action-accuracy eval every N optimizer steps when > 0.")
     parser.add_argument("--eval-before-train", action="store_true", help="Run one eval pass before the first training batch.")
     parser.add_argument("--eval-save-predictions-limit", type=int, default=0, help="Max rank0 eval predictions to save per eval; <=0 saves all rank0 predictions.")
+    parser.add_argument(
+        "--eval-save-model-text",
+        action="store_true",
+        help=(
+            "For non-SpokenWOZ saved predicted-speak rows, decode teacher-forced "
+            "agent-text logits into model_text. Streaming SpokenWOZ always saves generated text."
+        ),
+    )
+    parser.add_argument(
+        "--eval-max-new-speak-tokens-per-chunk",
+        type=int,
+        default=128,
+        help="Maximum greedy text tokens generated for each SpokenWOZ duplex unit.",
+    )
     parser.add_argument(
         "--speak-threshold-sweep",
         default="",
@@ -1436,10 +2016,45 @@ def main() -> None:
         default=3,
         help="Keep at most this many ckpt-* intermediate checkpoints; 0 keeps all. The final checkpoint is never pruned.",
     )
+    parser.add_argument(
+        "--save-best-trajectory-checkpoint",
+        action="store_true",
+        help=(
+            "Disable step/final checkpoints and keep only the epoch checkpoint with "
+            "the highest validation trajectory accuracy. Ties keep the earlier checkpoint."
+        ),
+    )
     parser.add_argument("--no-save-checkpoints", action="store_true")
     parser.add_argument("--gradient-checkpointing", action="store_true")
     parser.add_argument("--trajectory-mode", action="store_true", help="Group point samples from the same event into multi-turn trajectories.")
     parser.add_argument("--generated-trajectory-mode", action="store_true", help="Load generated messages/images rows as multi-turn trajectories.")
+    parser.add_argument(
+        "--spokenwoz-mode",
+        action="store_true",
+        help="Load SpokenWOZ parquet rows, group by wav_id, and build duplex audio units.",
+    )
+    parser.add_argument(
+        "--spokenwoz-audio-chunk-seconds",
+        type=float,
+        default=1.0,
+        help="Fixed duplex audio unit duration; the final partial unit is right-zero-padded.",
+    )
+    parser.add_argument("--spokenwoz-sampling-rate", type=int, default=16000)
+    parser.add_argument(
+        "--spokenwoz-train-parquet-prefix",
+        default="train",
+        help="When train-data is a directory, recursively load only parquet filenames with this prefix.",
+    )
+    parser.add_argument(
+        "--spokenwoz-eval-parquet-prefix",
+        default="dev",
+        help="When eval-data is a directory, recursively load only parquet filenames with this prefix.",
+    )
+    parser.add_argument(
+        "--pyarrow-site-packages",
+        default="",
+        help="Optional compatible site-packages directory used only if pyarrow is absent from the train env.",
+    )
     parser.add_argument(
         "--input-schema",
         choices=("chatml", "duplex"),
@@ -1500,8 +2115,16 @@ def main() -> None:
     args = parser.parse_args()
     if args.max_ckpt_limit < 0:
         parser.error("--max-ckpt-limit must be >= 0")
+    if args.max_eval_batches < 0:
+        parser.error("--max-eval-batches must be >= 0")
+    if args.eval_max_new_speak_tokens_per_chunk < 2:
+        parser.error("--eval-max-new-speak-tokens-per-chunk must be at least 2")
     if args.eval_only and args.no_eval:
         parser.error("--eval-only cannot be combined with --no-eval")
+    if args.save_best_trajectory_checkpoint and args.no_eval:
+        parser.error("--save-best-trajectory-checkpoint requires evaluation")
+    if args.save_best_trajectory_checkpoint and args.no_save_checkpoints:
+        parser.error("--save-best-trajectory-checkpoint cannot be combined with --no-save-checkpoints")
 
     _set_default_hf_cache()
     device = _setup_dist()
@@ -1526,12 +2149,18 @@ def main() -> None:
 
     logger = setup_logging(log_dir=args.log_dir, name="text_policy_fsdp")
     metrics = JsonlMetricLogger(output_dir / "metrics.jsonl")
+    wandb_run = _init_wandb(args, output_dir, logger)
     logger.info("hf_home=%s", os.environ.get("HF_HOME"))
     logger.info("model=%s", args.model)
     logger.info("tokenizer_model=%s processor_model=%s", args.tokenizer_model or args.model, args.processor_model or args.model)
     logger.info("no_lora=true init_tts=false trainable_scope=llm fsdp=true world_size=%d max_length=%d", _world_size(), args.max_length)
     logger.info("train_data=%s eval_data=%s output_dir=%s", args.train_data, args.eval_data, output_dir)
     logger.info("eval_enabled=%s", not args.no_eval)
+    logger.info(
+        "eval_mode=%s eval_save_model_text=%s",
+        "spokenwoz_streaming_episode_v2" if args.spokenwoz_mode else "teacher_forced",
+        "ignored" if args.spokenwoz_mode else args.eval_save_model_text,
+    )
     logger.info("auto_resume checkpoint=%s", resume_checkpoint or "none")
     logger.info("torch=%s device=%s dtype=%s", torch.__version__, device, torch.bfloat16)
 
@@ -1546,12 +2175,31 @@ def main() -> None:
         processor.image_processor.scale_resolution = args.image_scale_resolution
         logger.info("image_scale_resolution=%d", args.image_scale_resolution)
 
-    if args.generated_trajectory_mode and args.trajectory_mode:
-        raise ValueError("Use only one of --generated-trajectory-mode or --trajectory-mode")
-    if args.input_schema == "duplex" and not (args.generated_trajectory_mode or args.trajectory_mode):
-        raise ValueError("--input-schema duplex requires --generated-trajectory-mode or --trajectory-mode")
+    selected_dataset_modes = sum(
+        int(enabled)
+        for enabled in (args.generated_trajectory_mode, args.trajectory_mode, args.spokenwoz_mode)
+    )
+    if selected_dataset_modes > 1:
+        raise ValueError(
+            "Use only one of --generated-trajectory-mode, --trajectory-mode, or --spokenwoz-mode"
+        )
+    if args.input_schema == "duplex" and selected_dataset_modes == 0:
+        raise ValueError(
+            "--input-schema duplex requires --generated-trajectory-mode, --trajectory-mode, or --spokenwoz-mode"
+        )
+    if args.spokenwoz_mode and args.input_schema != "duplex":
+        raise ValueError("--spokenwoz-mode requires --input-schema duplex")
+    if args.spokenwoz_mode and args.spokenwoz_audio_chunk_seconds <= 0:
+        raise ValueError("--spokenwoz-audio-chunk-seconds must be > 0")
+    if args.spokenwoz_mode and (args.batch_size != 1 or args.eval_batch_size != 1):
+        raise ValueError(
+            "SpokenWOZ duplex audio currently requires --batch-size 1 and --eval-batch-size 1 "
+            "because MiniCPM-o's stream_input audio embedding path is batch-size-1 only"
+        )
 
-    if args.generated_trajectory_mode:
+    if args.spokenwoz_mode:
+        dataset_cls = MiniCPMOSpokenWozDuplexDataset
+    elif args.generated_trajectory_mode:
         dataset_cls = MiniCPMOGeneratedTrajectoryDataset
     elif args.trajectory_mode:
         dataset_cls = MiniCPMOTrajectoryDataset
@@ -1564,14 +2212,24 @@ def main() -> None:
         args.trajectory_chunk_stride if args.eval_trajectory_chunk_stride < 0 else args.eval_trajectory_chunk_stride
     )
 
-    dataset_kwargs_base = {
-        "num_frames": args.num_frames,
-        "window_seconds": args.window_seconds,
-        "strict_media": True,
-    }
+    if args.spokenwoz_mode:
+        dataset_kwargs_base = {
+            "audio_chunk_seconds": args.spokenwoz_audio_chunk_seconds,
+            "sampling_rate": args.spokenwoz_sampling_rate,
+            "pyarrow_site_packages": args.pyarrow_site_packages,
+        }
+    else:
+        dataset_kwargs_base = {
+            "num_frames": args.num_frames,
+            "window_seconds": args.window_seconds,
+            "strict_media": True,
+        }
     train_dataset_kwargs = dict(dataset_kwargs_base)
     eval_dataset_kwargs = dict(dataset_kwargs_base)
-    if args.generated_trajectory_mode:
+    if args.spokenwoz_mode:
+        train_dataset_kwargs["parquet_filename_prefix"] = args.spokenwoz_train_parquet_prefix
+        eval_dataset_kwargs["parquet_filename_prefix"] = args.spokenwoz_eval_parquet_prefix
+    elif args.generated_trajectory_mode:
         train_dataset_kwargs.update(
             {
                 "max_turns": args.trajectory_max_turns,
@@ -1669,6 +2327,8 @@ def main() -> None:
         speak_weight=args.speak_weight,
         speak_boundary_weight=args.speak_boundary_weight,
         delegate_weight=args.delegate_weight,
+        stream_input=args.spokenwoz_mode,
+        sampling_rate=args.spokenwoz_sampling_rate if args.spokenwoz_mode else 16000,
     )
     eval_collator = collator_cls(
         processor=processor,
@@ -1680,6 +2340,8 @@ def main() -> None:
         speak_weight=args.speak_weight,
         speak_boundary_weight=args.speak_boundary_weight,
         delegate_weight=args.delegate_weight,
+        stream_input=args.spokenwoz_mode,
+        sampling_rate=args.spokenwoz_sampling_rate if args.spokenwoz_mode else 16000,
     )
     logger.info("input_schema=%s collator=%s", args.input_schema, collator_cls.__name__)
 
@@ -1706,6 +2368,13 @@ def main() -> None:
     if args.vision_batch_size > 0 and hasattr(model, "config"):
         model.config.vision_batch_size = args.vision_batch_size
         logger.info("vision_batch_size=%d", args.vision_batch_size)
+    if args.spokenwoz_mode:
+        model.config.audio_chunk_length = args.spokenwoz_audio_chunk_seconds
+        model.config.stream_input = True
+        logger.info(
+            "spokenwoz_audio_model_config audio_chunk_length=%.3f stream_input=true audio_modules=frozen",
+            args.spokenwoz_audio_chunk_seconds,
+        )
     if args.gradient_checkpointing:
         target = model.llm if hasattr(model, "llm") else model
         if hasattr(target, "gradient_checkpointing_enable"):
@@ -1717,6 +2386,16 @@ def main() -> None:
     model.to(device)
     model = _wrap_model_fsdp(model, device)
     model.train()
+    spokenwoz_eval_model = None
+    if args.spokenwoz_mode and not args.no_eval:
+        spokenwoz_eval_model = _load_spokenwoz_streaming_eval_model(
+            args.model,
+            tokenizer_path=args.tokenizer_model or args.model,
+            processor_path=args.processor_model or args.model,
+            audio_chunk_seconds=args.spokenwoz_audio_chunk_seconds,
+            attn_implementation=args.attn_implementation,
+            logger=logger,
+        )
     logger.info(
         "model_loaded total_params=%d trainable_params=%d train_rows=%s eval_rows=%d num_frames=%d eval_only=%s",
         total,
@@ -1749,6 +2428,23 @@ def main() -> None:
             args.drop_placeholder_speak_chunks,
             args.clean_event_grounding_templates,
         )
+    elif args.spokenwoz_mode:
+        logger.info(
+            "spokenwoz_mode=true train_dialogs=%s train_source_rows=%s eval_dialogs=%d "
+            "eval_source_rows=%d train_parquet_files=%d eval_parquet_files=%d "
+            "train_prefix=%s eval_prefix=%s audio_chunk_seconds=%.3f sampling_rate=%d tail_policy=right_zero_pad "
+            "metadata_policy=domains_slots_eval_only",
+            len(train_dataset) if train_dataset is not None else "skipped",
+            getattr(train_dataset, "source_row_count", "skipped"),
+            len(eval_dataset),
+            getattr(eval_dataset, "source_row_count", -1),
+            len(getattr(train_dataset, "parquet_paths", [])) if train_dataset is not None else 0,
+            len(getattr(eval_dataset, "parquet_paths", [])),
+            args.spokenwoz_train_parquet_prefix,
+            args.spokenwoz_eval_parquet_prefix,
+            args.spokenwoz_audio_chunk_seconds,
+            args.spokenwoz_sampling_rate,
+        )
     elif args.trajectory_mode:
         logger.info(
             "trajectory_mode=true train_max_turns=%d eval_max_turns=%d include_single_turn=%s",
@@ -1758,44 +2454,63 @@ def main() -> None:
         )
 
     if args.eval_only:
-        eval_loader, eval_sampler = _build_loader(
-            eval_dataset,
-            eval_collator,
-            batch_size=args.eval_batch_size,
-            shuffle=False,
-            seed=args.seed,
-        )
-        eval_sampler.set_epoch(0)
-        eval_metrics = _evaluate(
-            model,
-            eval_loader,
-            device,
-            args.max_eval_batches,
+        eval_loader = None
+        if not args.spokenwoz_mode:
+            eval_loader, eval_sampler = _build_loader(
+                eval_dataset,
+                eval_collator,
+                batch_size=args.eval_batch_size,
+                shuffle=False,
+                seed=args.seed,
+            )
+            eval_sampler.set_epoch(0)
+        eval_metrics = _run_evaluation(
+            args=args,
+            model=model,
+            spokenwoz_eval_model=spokenwoz_eval_model,
+            eval_dataset=eval_dataset,
+            eval_loader=eval_loader,
+            device=device,
             tokenizer=tokenizer,
             prediction_output=output_dir / "eval_predictions" / "eval_only.jsonl",
-            prediction_limit=args.eval_save_predictions_limit,
             eval_name="eval_only",
             speak_threshold_sweep=speak_threshold_sweep,
+            logger=logger,
         )
         if _is_rank0():
             with (output_dir / "eval_only_metrics.json").open("w", encoding="utf-8") as fh:
                 json.dump(eval_metrics, fh, ensure_ascii=False, indent=2, sort_keys=True)
             metrics.log(event="eval_only", step=0, **eval_metrics)
-            logger.info(
-                "eval_only_complete loss=%.6f action_acc=%.6f trajectory_acc=%.6f trajectory_late1_acc=%.6f "
-                "listen_acc=%.6f speak_acc=%.6f delegate_acc=%.6f action_total=%d trajectory_total=%d pred_file=%s metrics_file=%s",
-                eval_metrics["loss"],
-                eval_metrics["action_accuracy"],
-                eval_metrics["trajectory_accuracy"],
-                eval_metrics["trajectory_late1_accuracy"],
-                eval_metrics["listen_accuracy"],
-                eval_metrics["speak_accuracy"],
-                eval_metrics["delegate_accuracy"],
-                eval_metrics["action_total"],
-                eval_metrics["trajectory_total"],
-                eval_metrics["prediction_output"],
-                output_dir / "eval_only_metrics.json",
+            _wandb_log(
+                wandb_run,
+                {"eval/stage": "eval_only", **_wandb_scalar_metrics(eval_metrics, "eval")},
+                0,
+                logger,
             )
+            if args.spokenwoz_mode:
+                _log_spokenwoz_eval_summary(
+                    logger,
+                    phase="eval_only_complete",
+                    metrics=eval_metrics,
+                    global_step=0,
+                )
+            else:
+                logger.info(
+                    "eval_only_complete loss=%.6f action_acc=%.6f trajectory_acc=%.6f trajectory_late1_acc=%.6f "
+                    "listen_acc=%.6f speak_acc=%.6f delegate_acc=%.6f action_total=%d trajectory_total=%d pred_file=%s metrics_file=%s",
+                    eval_metrics["loss"],
+                    eval_metrics["action_accuracy"],
+                    eval_metrics["trajectory_accuracy"],
+                    eval_metrics["trajectory_late1_accuracy"],
+                    eval_metrics["listen_accuracy"],
+                    eval_metrics["speak_accuracy"],
+                    eval_metrics["delegate_accuracy"],
+                    eval_metrics["action_total"],
+                    eval_metrics["trajectory_total"],
+                    eval_metrics["prediction_output"],
+                    output_dir / "eval_only_metrics.json",
+                )
+        _finish_wandb(wandb_run, logger)
         dist.barrier()
         _cleanup_dist()
         return
@@ -1805,6 +2520,16 @@ def main() -> None:
     global_step = int(resume_state.get("global_step_rank_local", 0)) if resume_state is not None else 0
     resume_epoch = int(resume_state.get("epoch", 1)) if resume_state is not None else 1
     resume_batch = int(resume_state.get("batch", 0)) if resume_state is not None else 0
+    best_trajectory_accuracy = (
+        float(resume_state.get("best_trajectory_accuracy", -math.inf))
+        if resume_state is not None
+        else -math.inf
+    )
+    best_trajectory_epoch = (
+        int(resume_state.get("best_trajectory_epoch", 0))
+        if resume_state is not None
+        else 0
+    )
     if resume_state is not None and resume_batch >= int(resume_state.get("batches_per_epoch", resume_batch + 1)):
         resume_epoch += 1
         resume_batch = 0
@@ -1827,15 +2552,19 @@ def main() -> None:
             action_labels=train_action_labels,
             listen_to_speak_ratio=args.train_listen_to_speak_ratio_keep_delegate,
         )
-        eval_loader, eval_sampler = _build_loader(
-            eval_dataset,
-            eval_collator,
-            batch_size=args.eval_batch_size,
-            shuffle=False,
-            seed=args.seed,
-        )
+        eval_loader = None
+        eval_sampler = None
+        if not args.spokenwoz_mode:
+            eval_loader, eval_sampler = _build_loader(
+                eval_dataset,
+                eval_collator,
+                batch_size=args.eval_batch_size,
+                shuffle=False,
+                seed=args.seed,
+            )
         train_sampler.set_epoch(epoch)
-        eval_sampler.set_epoch(epoch)
+        if eval_sampler is not None:
+            eval_sampler.set_epoch(epoch)
         train_batches_per_epoch = len(train_loader)
         if args.max_train_batches > 0:
             train_batches_per_epoch = min(train_batches_per_epoch, args.max_train_batches)
@@ -1865,52 +2594,70 @@ def main() -> None:
                     total_global_steps,
                 )
         if not args.no_eval and args.eval_before_train and not did_initial_eval:
-            eval_metrics = _evaluate(
-                model,
-                eval_loader,
-                device,
-                args.max_eval_batches,
+            eval_metrics = _run_evaluation(
+                args=args,
+                model=model,
+                spokenwoz_eval_model=spokenwoz_eval_model,
+                eval_dataset=eval_dataset,
+                eval_loader=eval_loader,
+                device=device,
                 tokenizer=tokenizer,
                 prediction_output=output_dir / "eval_predictions" / "step_00000000.jsonl",
-                prediction_limit=args.eval_save_predictions_limit,
                 eval_name="step_0",
                 speak_threshold_sweep=speak_threshold_sweep,
+                logger=logger,
             )
             if _is_rank0():
-                logger.info(
-                    "initial_eval step=0 loss=%.6f action_acc=%.6f trajectory_acc=%.6f trajectory_late1_acc=%.6f listen_acc=%.6f speak_acc=%.6f delegate_acc=%.6f speak_precision=%.6f delegate_precision=%.6f speak_seg_timing=%.6f event_late1_f1=%.6f transition_late1_f1=%.6f trunc_rate=%.6f traj_trunc_rate=%.6f action_total=%d truncated_total=%d trajectory_total=%d trajectory_truncated=%d listen_total=%d speak_total=%d delegate_total=%d task_traj_acc=%s task_traj_late1_acc=%s pred_file=%s",
-                    eval_metrics["loss"],
-                    eval_metrics["action_accuracy"],
-                    eval_metrics["trajectory_accuracy"],
-                    eval_metrics["trajectory_late1_accuracy"],
-                    eval_metrics["listen_accuracy"],
-                    eval_metrics["speak_accuracy"],
-                    eval_metrics["delegate_accuracy"],
-                    eval_metrics["speak_precision"],
-                    eval_metrics["delegate_precision"],
-                    eval_metrics["speak_segment_timing_score"],
-                    eval_metrics["event_late1_f1"],
-                    eval_metrics["transition_late1_f1"],
-                    eval_metrics["truncation_rate"],
-                    eval_metrics["trajectory_truncation_rate"],
-                    eval_metrics["action_total"],
-                    eval_metrics["truncated_total"],
-                    eval_metrics["trajectory_total"],
-                    eval_metrics["trajectory_truncated"],
-                    eval_metrics["listen_total"],
-                    eval_metrics["speak_total"],
-                    eval_metrics["delegate_total"],
-                    json.dumps(eval_metrics.get("trajectory_accuracy_by_task", {}), sort_keys=True),
-                    json.dumps(eval_metrics.get("trajectory_late1_accuracy_by_task", {}), sort_keys=True),
-                    eval_metrics["prediction_output"],
-                )
+                if args.spokenwoz_mode:
+                    _log_spokenwoz_eval_summary(
+                        logger,
+                        phase="initial_eval",
+                        metrics=eval_metrics,
+                        global_step=0,
+                    )
+                else:
+                    logger.info(
+                        "initial_eval step=0 loss=%.6f action_acc=%.6f trajectory_acc=%.6f trajectory_late1_acc=%.6f listen_acc=%.6f speak_acc=%.6f delegate_acc=%.6f speak_precision=%.6f delegate_precision=%.6f speak_seg_timing=%.6f event_late1_f1=%.6f transition_late1_f1=%.6f trunc_rate=%.6f traj_trunc_rate=%.6f action_total=%d truncated_total=%d trajectory_total=%d trajectory_truncated=%d listen_total=%d speak_total=%d delegate_total=%d task_traj_acc=%s task_traj_late1_acc=%s pred_file=%s",
+                        eval_metrics["loss"],
+                        eval_metrics["action_accuracy"],
+                        eval_metrics["trajectory_accuracy"],
+                        eval_metrics["trajectory_late1_accuracy"],
+                        eval_metrics["listen_accuracy"],
+                        eval_metrics["speak_accuracy"],
+                        eval_metrics["delegate_accuracy"],
+                        eval_metrics["speak_precision"],
+                        eval_metrics["delegate_precision"],
+                        eval_metrics["speak_segment_timing_score"],
+                        eval_metrics["event_late1_f1"],
+                        eval_metrics["transition_late1_f1"],
+                        eval_metrics["truncation_rate"],
+                        eval_metrics["trajectory_truncation_rate"],
+                        eval_metrics["action_total"],
+                        eval_metrics["truncated_total"],
+                        eval_metrics["trajectory_total"],
+                        eval_metrics["trajectory_truncated"],
+                        eval_metrics["listen_total"],
+                        eval_metrics["speak_total"],
+                        eval_metrics["delegate_total"],
+                        json.dumps(eval_metrics.get("trajectory_accuracy_by_task", {}), sort_keys=True),
+                        json.dumps(eval_metrics.get("trajectory_late1_accuracy_by_task", {}), sort_keys=True),
+                        eval_metrics["prediction_output"],
+                    )
                 metrics.log(event="initial_eval", step=0, **eval_metrics)
+                _wandb_log(
+                    wandb_run,
+                    {"eval/stage": "initial", **_wandb_scalar_metrics(eval_metrics, "eval")},
+                    0,
+                    logger,
+                )
             did_initial_eval = True
         if training_progress_start is None:
             training_progress_start = time.monotonic()
         optimizer.zero_grad(set_to_none=True)
         local_loss_sum = 0.0
         local_batches = 0
+        accumulated_loss_sum = 0.0
+        accumulated_loss_batches = 0
 
         for batch_idx, batch in enumerate(train_loader, start=1):
             if epoch == resume_epoch and batch_idx <= resume_batch:
@@ -1926,8 +2673,11 @@ def main() -> None:
             outputs = model(data=batch, use_cache=False)
             loss = _weighted_ce_loss(outputs.logits, labels, loss_weights)
             (loss / max(1, args.grad_accum_steps)).backward()
-            local_loss_sum += float(loss.detach().cpu())
+            loss_value = float(loss.detach().cpu())
+            local_loss_sum += loss_value
             local_batches += 1
+            accumulated_loss_sum += loss_value
+            accumulated_loss_batches += 1
 
             should_step = batch_idx % max(1, args.grad_accum_steps) == 0 or batch_idx == train_batches_per_epoch
             grad_norm = math.nan
@@ -1937,6 +2687,35 @@ def main() -> None:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
                 global_step += 1
+                step_loss_pair = torch.tensor(
+                    [accumulated_loss_sum, float(accumulated_loss_batches)],
+                    device=device,
+                    dtype=torch.float64,
+                )
+                dist.all_reduce(step_loss_pair, op=dist.ReduceOp.SUM)
+                step_loss = float((step_loss_pair[0] / step_loss_pair[1].clamp_min(1.0)).cpu())
+                if _is_rank0():
+                    completed_batches = (epoch - 1) * train_batches_per_epoch + min(
+                        batch_idx, train_batches_per_epoch
+                    )
+                    total_batches = train_batches_per_epoch * args.epochs
+                    _wandb_log(
+                        wandb_run,
+                        {
+                            "train/loss": step_loss,
+                            "train/epoch": epoch,
+                            "train/batch": batch_idx,
+                            "train/progress_percent": 100.0 * completed_batches / max(1, total_batches),
+                            "train/grad_norm": grad_norm,
+                            "train/learning_rate": float(optimizer.param_groups[0]["lr"]),
+                            "system/sequence_length": int(outputs.logits.shape[1]),
+                            "system/peak_alloc_gb": torch.cuda.max_memory_allocated(device) / 1024**3,
+                        },
+                        global_step,
+                        logger,
+                    )
+                accumulated_loss_sum = 0.0
+                accumulated_loss_batches = 0
 
             if _is_rank0() and should_step and global_step > 0 and global_step % max(1, args.log_every) == 0:
                 peak_alloc = torch.cuda.max_memory_allocated(device) / 1024**3
@@ -1967,48 +2746,76 @@ def main() -> None:
                     peak_alloc,
                 )
             if not args.no_eval and should_step and args.eval_every_steps > 0 and global_step > 0 and global_step % args.eval_every_steps == 0:
-                eval_metrics = _evaluate(
-                    model,
-                    eval_loader,
-                    device,
-                    args.max_eval_batches,
+                eval_metrics = _run_evaluation(
+                    args=args,
+                    model=model,
+                    spokenwoz_eval_model=spokenwoz_eval_model,
+                    eval_dataset=eval_dataset,
+                    eval_loader=eval_loader,
+                    device=device,
                     tokenizer=tokenizer,
                     prediction_output=output_dir / "eval_predictions" / f"step_{global_step:08d}.jsonl",
-                    prediction_limit=args.eval_save_predictions_limit,
                     eval_name=f"step_{global_step}",
                     speak_threshold_sweep=speak_threshold_sweep,
+                    logger=logger,
                 )
                 if _is_rank0():
-                    logger.info(
-                        "periodic_eval step=%d loss=%.6f action_acc=%.6f trajectory_acc=%.6f trajectory_late1_acc=%.6f listen_acc=%.6f speak_acc=%.6f delegate_acc=%.6f speak_precision=%.6f delegate_precision=%.6f speak_seg_timing=%.6f event_late1_f1=%.6f transition_late1_f1=%.6f trunc_rate=%.6f traj_trunc_rate=%.6f action_total=%d truncated_total=%d trajectory_total=%d trajectory_truncated=%d listen_total=%d speak_total=%d delegate_total=%d task_traj_acc=%s task_traj_late1_acc=%s pred_file=%s",
-                        global_step,
-                        eval_metrics["loss"],
-                        eval_metrics["action_accuracy"],
-                        eval_metrics["trajectory_accuracy"],
-                        eval_metrics["trajectory_late1_accuracy"],
-                        eval_metrics["listen_accuracy"],
-                        eval_metrics["speak_accuracy"],
-                        eval_metrics["delegate_accuracy"],
-                        eval_metrics["speak_precision"],
-                        eval_metrics["delegate_precision"],
-                        eval_metrics["speak_segment_timing_score"],
-                        eval_metrics["event_late1_f1"],
-                        eval_metrics["transition_late1_f1"],
-                        eval_metrics["truncation_rate"],
-                        eval_metrics["trajectory_truncation_rate"],
-                        eval_metrics["action_total"],
-                        eval_metrics["truncated_total"],
-                        eval_metrics["trajectory_total"],
-                        eval_metrics["trajectory_truncated"],
-                        eval_metrics["listen_total"],
-                        eval_metrics["speak_total"],
-                        eval_metrics["delegate_total"],
-                        json.dumps(eval_metrics.get("trajectory_accuracy_by_task", {}), sort_keys=True),
-                        json.dumps(eval_metrics.get("trajectory_late1_accuracy_by_task", {}), sort_keys=True),
-                        eval_metrics["prediction_output"],
-                    )
+                    if args.spokenwoz_mode:
+                        _log_spokenwoz_eval_summary(
+                            logger,
+                            phase="periodic_eval",
+                            metrics=eval_metrics,
+                            global_step=global_step,
+                        )
+                    else:
+                        logger.info(
+                            "periodic_eval step=%d loss=%.6f action_acc=%.6f trajectory_acc=%.6f trajectory_late1_acc=%.6f listen_acc=%.6f speak_acc=%.6f delegate_acc=%.6f speak_precision=%.6f delegate_precision=%.6f speak_seg_timing=%.6f event_late1_f1=%.6f transition_late1_f1=%.6f trunc_rate=%.6f traj_trunc_rate=%.6f action_total=%d truncated_total=%d trajectory_total=%d trajectory_truncated=%d listen_total=%d speak_total=%d delegate_total=%d task_traj_acc=%s task_traj_late1_acc=%s pred_file=%s",
+                            global_step,
+                            eval_metrics["loss"],
+                            eval_metrics["action_accuracy"],
+                            eval_metrics["trajectory_accuracy"],
+                            eval_metrics["trajectory_late1_accuracy"],
+                            eval_metrics["listen_accuracy"],
+                            eval_metrics["speak_accuracy"],
+                            eval_metrics["delegate_accuracy"],
+                            eval_metrics["speak_precision"],
+                            eval_metrics["delegate_precision"],
+                            eval_metrics["speak_segment_timing_score"],
+                            eval_metrics["event_late1_f1"],
+                            eval_metrics["transition_late1_f1"],
+                            eval_metrics["truncation_rate"],
+                            eval_metrics["trajectory_truncation_rate"],
+                            eval_metrics["action_total"],
+                            eval_metrics["truncated_total"],
+                            eval_metrics["trajectory_total"],
+                            eval_metrics["trajectory_truncated"],
+                            eval_metrics["listen_total"],
+                            eval_metrics["speak_total"],
+                            eval_metrics["delegate_total"],
+                            json.dumps(
+                                eval_metrics.get("trajectory_accuracy_by_task", {}),
+                                sort_keys=True,
+                            ),
+                            json.dumps(
+                                eval_metrics.get("trajectory_late1_accuracy_by_task", {}),
+                                sort_keys=True,
+                            ),
+                            eval_metrics["prediction_output"],
+                        )
                     metrics.log(event="periodic_eval", step=global_step, **eval_metrics)
-            if should_step and args.save_every_steps > 0 and global_step > 0 and global_step % args.save_every_steps == 0:
+                    _wandb_log(
+                        wandb_run,
+                        {"eval/stage": "periodic", **_wandb_scalar_metrics(eval_metrics, "eval")},
+                        global_step,
+                        logger,
+                    )
+            if (
+                should_step
+                and not args.save_best_trajectory_checkpoint
+                and args.save_every_steps > 0
+                and global_step > 0
+                and global_step % args.save_every_steps == 0
+            ):
                 if args.no_save_checkpoints:
                     dist.barrier()
                     if _is_rank0():
@@ -2061,20 +2868,30 @@ def main() -> None:
         train_loss = float((loss_pair[0] / loss_pair[1].clamp_min(1)).cpu())
         eval_metrics = None
         if not args.no_eval:
-            eval_metrics = _evaluate(
-                model,
-                eval_loader,
-                device,
-                args.max_eval_batches,
+            eval_metrics = _run_evaluation(
+                args=args,
+                model=model,
+                spokenwoz_eval_model=spokenwoz_eval_model,
+                eval_dataset=eval_dataset,
+                eval_loader=eval_loader,
+                device=device,
                 tokenizer=tokenizer,
                 prediction_output=output_dir / "eval_predictions" / f"epoch_{epoch:03d}.jsonl",
-                prediction_limit=args.eval_save_predictions_limit,
                 eval_name=f"epoch_{epoch}",
                 speak_threshold_sweep=speak_threshold_sweep,
+                logger=logger,
             )
         elapsed = time.time() - epoch_start
         peak_alloc = torch.cuda.max_memory_allocated(device) / 1024**3
         peak_reserved = torch.cuda.max_memory_reserved(device) / 1024**3
+        trajectory_checkpoint_improved = False
+        if args.save_best_trajectory_checkpoint and eval_metrics is not None:
+            trajectory_metric_key = "trajectory_acc" if args.spokenwoz_mode else "trajectory_accuracy"
+            current_trajectory_accuracy = float(eval_metrics[trajectory_metric_key])
+            if current_trajectory_accuracy > best_trajectory_accuracy:
+                best_trajectory_accuracy = current_trajectory_accuracy
+                best_trajectory_epoch = epoch
+                trajectory_checkpoint_improved = True
         state = {
             "epoch": epoch,
             "epochs": args.epochs,
@@ -2091,40 +2908,108 @@ def main() -> None:
             "num_frames": args.num_frames,
             "save_every_steps": args.save_every_steps,
         }
-        if eval_metrics is not None:
+        if args.save_best_trajectory_checkpoint:
             state.update(
                 {
-                    "eval_loss": eval_metrics["loss"],
-                    "eval_batches_all_ranks": eval_metrics["batches_all_ranks"],
-                    "eval_action_accuracy": eval_metrics["action_accuracy"],
-                    "eval_action_total": eval_metrics["action_total"],
-                    "eval_action_correct": eval_metrics["action_correct"],
-                    "eval_truncated_total": eval_metrics["truncated_total"],
-                    "eval_truncation_rate": eval_metrics["truncation_rate"],
-                    "eval_listen_accuracy": eval_metrics["listen_accuracy"],
-                    "eval_listen_total": eval_metrics["listen_total"],
-                    "eval_speak_accuracy": eval_metrics["speak_accuracy"],
-                    "eval_speak_total": eval_metrics["speak_total"],
-                    "eval_delegate_accuracy": eval_metrics["delegate_accuracy"],
-                    "eval_delegate_total": eval_metrics["delegate_total"],
-                    "eval_trajectory_accuracy": eval_metrics["trajectory_accuracy"],
-                    "eval_trajectory_late1_accuracy": eval_metrics["trajectory_late1_accuracy"],
-                    "eval_trajectory_total": eval_metrics["trajectory_total"],
-                    "eval_trajectory_all_correct": eval_metrics["trajectory_all_correct"],
-                    "eval_trajectory_late1_all_correct": eval_metrics["trajectory_late1_all_correct"],
-                    "eval_trajectory_truncated": eval_metrics["trajectory_truncated"],
-                    "eval_trajectory_truncation_rate": eval_metrics["trajectory_truncation_rate"],
-                    "eval_speak_precision": eval_metrics["speak_precision"],
-                    "eval_delegate_precision": eval_metrics["delegate_precision"],
-                    "eval_speak_segment_timing_score": eval_metrics["speak_segment_timing_score"],
-                    "eval_event_late1_f1": eval_metrics["event_late1_f1"],
-                    "eval_transition_late1_f1": eval_metrics["transition_late1_f1"],
-                    "eval_task_metrics": eval_metrics.get("task_metrics", {}),
-                    "eval_trajectory_accuracy_by_task": eval_metrics.get("trajectory_accuracy_by_task", {}),
-                    "eval_trajectory_late1_accuracy_by_task": eval_metrics.get("trajectory_late1_accuracy_by_task", {}),
-                    "eval_speak_segment_timing_score_by_task": eval_metrics.get("speak_segment_timing_score_by_task", {}),
+                    "best_trajectory_accuracy": best_trajectory_accuracy,
+                    "best_trajectory_epoch": best_trajectory_epoch,
                 }
             )
+        if eval_metrics is not None:
+            if args.spokenwoz_mode:
+                state.update(
+                    {
+                        "eval_evaluation_schema": eval_metrics["evaluation_schema"],
+                        "eval_raw_gold_points": eval_metrics["raw_gold_points"],
+                        "eval_total_input_points": eval_metrics["total_input_points"],
+                        "eval_scorable_idle_points": eval_metrics["scorable_idle_points"],
+                        "eval_continuation_points": eval_metrics["continuation_points"],
+                        "eval_should_speak_points": eval_metrics["should_speak_points"],
+                        "eval_should_speak_predicted_speak": eval_metrics[
+                            "should_speak_predicted_speak"
+                        ],
+                        "eval_speak_recall": eval_metrics["speak_recall"],
+                        "eval_should_listen_points": eval_metrics["should_listen_points"],
+                        "eval_should_listen_predicted_speak": eval_metrics[
+                            "should_listen_predicted_speak"
+                        ],
+                        "eval_false_speak_rate": eval_metrics["false_speak_rate"],
+                        "eval_trajectory_acc": eval_metrics["trajectory_acc"],
+                        # Keep the historical state key readable by resume/reporting tools.
+                        "eval_trajectory_accuracy": eval_metrics["trajectory_acc"],
+                        "eval_trajectory_total": eval_metrics["trajectory_total"],
+                        "eval_trajectory_all_correct": eval_metrics["trajectory_correct"],
+                        "eval_response_episode_count": eval_metrics[
+                            "response_episode_count"
+                        ],
+                        "eval_complete_response_episodes": eval_metrics[
+                            "complete_response_episodes"
+                        ],
+                        "eval_incomplete_response_episodes": eval_metrics[
+                            "incomplete_response_episodes"
+                        ],
+                        "eval_n_model_tokens": eval_metrics["n_model_tokens"],
+                        "eval_n_tts_tokens": eval_metrics["n_tts_tokens"],
+                        "eval_prediction_output": eval_metrics["prediction_output"],
+                        "eval_episodes_output": eval_metrics["episodes_output"],
+                    }
+                )
+            else:
+                state.update(
+                    {
+                        "eval_loss": eval_metrics["loss"],
+                        "eval_batches_all_ranks": eval_metrics["batches_all_ranks"],
+                        "eval_action_accuracy": eval_metrics["action_accuracy"],
+                        "eval_action_total": eval_metrics["action_total"],
+                        "eval_action_correct": eval_metrics["action_correct"],
+                        "eval_truncated_total": eval_metrics["truncated_total"],
+                        "eval_truncation_rate": eval_metrics["truncation_rate"],
+                        "eval_listen_accuracy": eval_metrics["listen_accuracy"],
+                        "eval_listen_total": eval_metrics["listen_total"],
+                        "eval_speak_accuracy": eval_metrics["speak_accuracy"],
+                        "eval_speak_total": eval_metrics["speak_total"],
+                        "eval_delegate_accuracy": eval_metrics["delegate_accuracy"],
+                        "eval_delegate_total": eval_metrics["delegate_total"],
+                        "eval_trajectory_accuracy": eval_metrics[
+                            "trajectory_accuracy"
+                        ],
+                        "eval_trajectory_late1_accuracy": eval_metrics[
+                            "trajectory_late1_accuracy"
+                        ],
+                        "eval_trajectory_total": eval_metrics["trajectory_total"],
+                        "eval_trajectory_all_correct": eval_metrics[
+                            "trajectory_all_correct"
+                        ],
+                        "eval_trajectory_late1_all_correct": eval_metrics[
+                            "trajectory_late1_all_correct"
+                        ],
+                        "eval_trajectory_truncated": eval_metrics[
+                            "trajectory_truncated"
+                        ],
+                        "eval_trajectory_truncation_rate": eval_metrics[
+                            "trajectory_truncation_rate"
+                        ],
+                        "eval_speak_precision": eval_metrics["speak_precision"],
+                        "eval_delegate_precision": eval_metrics["delegate_precision"],
+                        "eval_speak_segment_timing_score": eval_metrics[
+                            "speak_segment_timing_score"
+                        ],
+                        "eval_event_late1_f1": eval_metrics["event_late1_f1"],
+                        "eval_transition_late1_f1": eval_metrics[
+                            "transition_late1_f1"
+                        ],
+                        "eval_task_metrics": eval_metrics.get("task_metrics", {}),
+                        "eval_trajectory_accuracy_by_task": eval_metrics.get(
+                            "trajectory_accuracy_by_task", {}
+                        ),
+                        "eval_trajectory_late1_accuracy_by_task": eval_metrics.get(
+                            "trajectory_late1_accuracy_by_task", {}
+                        ),
+                        "eval_speak_segment_timing_score_by_task": eval_metrics.get(
+                            "speak_segment_timing_score_by_task", {}
+                        ),
+                    }
+                )
         if _is_rank0():
             with (output_dir / "last_state.json").open("w", encoding="utf-8") as fh:
                 json.dump(state, fh, ensure_ascii=False, indent=2, sort_keys=True)
@@ -2136,6 +3021,13 @@ def main() -> None:
                     elapsed,
                     peak_alloc,
                     peak_reserved,
+                )
+            elif args.spokenwoz_mode:
+                _log_spokenwoz_eval_summary(
+                    logger,
+                    phase=f"epoch_done epoch={epoch} train_loss={train_loss:.6f}",
+                    metrics=eval_metrics,
+                    global_step=global_step,
                 )
             else:
                 logger.info(
@@ -2164,8 +3056,87 @@ def main() -> None:
                     peak_reserved,
                 )
             metrics.log(event="epoch_done", **state, peak_alloc_gb=peak_alloc, peak_reserved_gb=peak_reserved)
+            _wandb_log(
+                wandb_run,
+                {
+                    "train/epoch": epoch,
+                    "train/epoch_loss": train_loss,
+                    "system/peak_alloc_gb": peak_alloc,
+                    "system/peak_reserved_gb": peak_reserved,
+                    **(
+                        {"eval/stage": "epoch", **_wandb_scalar_metrics(eval_metrics, "eval")}
+                        if eval_metrics is not None
+                        else {}
+                    ),
+                },
+                global_step,
+                logger,
+            )
+        if trajectory_checkpoint_improved:
+            checkpoint_root = output_dir / "ckpt"
+            checkpoint_state = {
+                **state,
+                "batch": train_batches_per_epoch,
+                "batches_per_epoch": train_batches_per_epoch,
+                "batch_size": args.batch_size,
+                "grad_accum_steps": args.grad_accum_steps,
+                "train_data": str(args.train_data),
+                "model": str(args.model),
+                "seed": args.seed,
+                "resume_config": _resume_config(args),
+                "checkpoint_metric": (
+                    "trajectory_acc" if args.spokenwoz_mode else "trajectory_accuracy"
+                ),
+                "checkpoint_metric_value": best_trajectory_accuracy,
+            }
+            checkpoint_name = f"ckpt-{global_step}"
+            _save_checkpoint(
+                model=model,
+                processor=processor,
+                tokenizer=tokenizer,
+                output_dir=checkpoint_root,
+                epoch=epoch,
+                state=checkpoint_state,
+                logger=logger,
+                source_model_path=args.model,
+                checkpoint_name=checkpoint_name,
+                optimizer=optimizer,
+            )
+            if _is_rank0():
+                checkpoint_path = checkpoint_root / checkpoint_name
+                best_metadata = {
+                    "epoch": epoch,
+                    "global_step_rank_local": global_step,
+                    "trajectory_accuracy": best_trajectory_accuracy,
+                    **(
+                        {"trajectory_acc": best_trajectory_accuracy}
+                        if args.spokenwoz_mode
+                        else {}
+                    ),
+                    "path": str(checkpoint_path),
+                }
+                with (output_dir / "best_trajectory_checkpoint.json").open("w", encoding="utf-8") as fh:
+                    json.dump(best_metadata, fh, ensure_ascii=False, indent=2, sort_keys=True)
+                metrics.log(event="best_trajectory_checkpoint_saved", **best_metadata)
+                _prune_intermediate_checkpoints(checkpoint_root, 1, logger)
+                logger.info(
+                    "best_trajectory_checkpoint_updated epoch=%d trajectory_acc=%.6f path=%s",
+                    epoch,
+                    best_trajectory_accuracy,
+                    checkpoint_path,
+                )
+            dist.barrier()
         if epoch == args.epochs:
-            if args.no_save_checkpoints:
+            if args.save_best_trajectory_checkpoint:
+                dist.barrier()
+                if _is_rank0():
+                    logger.info(
+                        "final_checkpoint_skipped save_best_trajectory_checkpoint=true "
+                        "best_epoch=%d best_trajectory_acc=%.6f",
+                        best_trajectory_epoch,
+                        best_trajectory_accuracy,
+                    )
+            elif args.no_save_checkpoints:
                 dist.barrier()
                 logger.info("final_checkpoint_skipped no_save_checkpoints=true")
             else:
@@ -2182,6 +3153,7 @@ def main() -> None:
                 )
 
     logger.info("training_complete epochs=%d output_dir=%s", args.epochs, output_dir)
+    _finish_wandb(wandb_run, logger)
     _cleanup_dist()
 
 

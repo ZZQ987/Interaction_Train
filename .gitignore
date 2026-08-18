@@ -1,4 +1,12 @@
 minicpmo_runs/
 modeling_minicpmo.py
+submit-rjob-holder.sh
 __pycache__/
 *.py[cod]
+change-explain/
+aux-scripts/
+audio-exports/
+data/
+minicpmo_sft/tests
+.pytest_cache/
+

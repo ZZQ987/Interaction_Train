@@ -7,13 +7,17 @@ the CookBook official dataset loader currently targets image conversations.
 
 from __future__ import annotations
 
+import ast
 import hashlib
+import io
 import json
 import math
 import os
 import re
+import sys
 import tarfile
 import time
+import wave
 from bisect import bisect_right
 from contextlib import contextmanager
 from pathlib import Path
@@ -1477,6 +1481,303 @@ class MiniCPMOGeneratedTrajectoryDataset:
         )
 
 
+def _import_pyarrow_parquet(site_packages: str | os.PathLike[str] | None = None) -> Any:
+    """Import the optional Parquet dependency without shadowing the train env.
+
+    Some training images keep pyarrow in a second Python 3.12 environment.  An
+    explicitly supplied site-packages directory is appended (not prepended) so
+    Torch/Transformers continue to come from the active training environment.
+    """
+
+    try:
+        import pyarrow.parquet as parquet
+
+        return parquet
+    except ImportError as first_exc:
+        if site_packages:
+            site_path = str(Path(site_packages).resolve())
+            if site_path not in sys.path:
+                sys.path.append(site_path)
+            try:
+                import pyarrow.parquet as parquet
+
+                return parquet
+            except ImportError:
+                pass
+        raise ImportError(
+            "SpokenWOZ parquet loading requires pyarrow. Install pyarrow in the "
+            "training environment or pass --pyarrow-site-packages with a compatible "
+            "Python site-packages directory."
+        ) from first_exc
+
+
+def _discover_parquet_files(
+    path: str | os.PathLike[str],
+    filename_prefix: str = "",
+) -> List[Path]:
+    path = Path(path)
+    if path.is_file():
+        if path.suffix.lower() != ".parquet":
+            raise ValueError(f"SpokenWOZ input must be a parquet file: {path}")
+        if filename_prefix and not path.name.startswith(filename_prefix):
+            raise ValueError(
+                f"SpokenWOZ parquet filename {path.name!r} does not start with "
+                f"the required prefix {filename_prefix!r}"
+            )
+        return [path]
+    if not path.is_dir():
+        raise FileNotFoundError(path)
+    files = sorted(
+        candidate
+        for candidate in path.rglob("*.parquet")
+        if not filename_prefix or candidate.name.startswith(filename_prefix)
+    )
+    if not files:
+        prefix_note = f" starting with {filename_prefix!r}" if filename_prefix else ""
+        raise FileNotFoundError(f"no parquet files{prefix_note} found under {path}")
+    return files
+
+
+def _parse_literal_metadata(value: Any, fallback: Any) -> Any:
+    if value is None:
+        return fallback
+    if isinstance(value, (list, dict)):
+        return value
+    try:
+        parsed = ast.literal_eval(str(value))
+    except (SyntaxError, ValueError):
+        return fallback
+    return parsed if isinstance(parsed, type(fallback)) else fallback
+
+
+def _decode_pcm_wav(audio: Any, target_sampling_rate: int) -> np.ndarray:
+    """Decode the Hugging Face Audio parquet struct into mono float32 PCM."""
+
+    if not isinstance(audio, dict):
+        raise TypeError(f"expected audio struct with bytes/path, got {type(audio)!r}")
+    audio_bytes = audio.get("bytes")
+    audio_path = audio.get("path")
+    source: Any
+    if audio_bytes:
+        source = io.BytesIO(audio_bytes)
+    elif audio_path:
+        source = str(audio_path)
+    else:
+        raise ValueError("audio struct contains neither bytes nor path")
+
+    with wave.open(source, "rb") as wav:
+        channels = int(wav.getnchannels())
+        sample_width = int(wav.getsampwidth())
+        sampling_rate = int(wav.getframerate())
+        frames = wav.readframes(wav.getnframes())
+
+    if sample_width == 1:
+        pcm = (np.frombuffer(frames, dtype=np.uint8).astype(np.float32) - 128.0) / 128.0
+    elif sample_width == 2:
+        pcm = np.frombuffer(frames, dtype="<i2").astype(np.float32) / 32768.0
+    elif sample_width == 4:
+        pcm = np.frombuffer(frames, dtype="<i4").astype(np.float32) / 2147483648.0
+    else:
+        raise ValueError(f"unsupported PCM WAV sample width: {sample_width} bytes")
+    if channels > 1:
+        if len(pcm) % channels:
+            raise ValueError("interleaved PCM length is not divisible by channel count")
+        pcm = pcm.reshape(-1, channels).mean(axis=1)
+    if sampling_rate != target_sampling_rate and len(pcm):
+        output_length = max(1, int(round(len(pcm) * target_sampling_rate / sampling_rate)))
+        source_positions = np.arange(len(pcm), dtype=np.float64)
+        target_positions = np.linspace(0.0, max(0, len(pcm) - 1), output_length)
+        pcm = np.interp(target_positions, source_positions, pcm).astype(np.float32)
+    return np.asarray(pcm, dtype=np.float32)
+
+
+class MiniCPMOSpokenWozDuplexDataset:
+    """Build one duplex audio trajectory per SpokenWOZ ``wav_id``.
+
+    Each user waveform is split into fixed-duration chunks.  Non-final chunks
+    supervise only ``<|listen|>``.  The final chunk is right-padded with digital
+    silence and supervises ``<|speak|>`` plus that row's ``agent_text``.  Rows
+    sharing a ``wav_id`` are ordered by ``turn_index`` and serialized into one
+    conversation, so prior audio and agent replies remain in the LLM context.
+
+    ``text``, ``domains`` and ``slots`` are retained as annotation/evaluation
+    metadata but deliberately not inserted into model input or labels.  This
+    prevents transcript/state leakage at inference time.
+    """
+
+    INDEX_COLUMNS = ("wav_id", "turn_index", "text", "agent_text", "domains", "slots")
+
+    def __init__(
+        self,
+        annotation_path: str | os.PathLike[str],
+        *,
+        audio_chunk_seconds: float = 1.0,
+        sampling_rate: int = 16000,
+        pyarrow_site_packages: str | os.PathLike[str] | None = None,
+        parquet_filename_prefix: str = "",
+    ) -> None:
+        if audio_chunk_seconds <= 0:
+            raise ValueError("audio_chunk_seconds must be > 0")
+        if sampling_rate <= 0:
+            raise ValueError("sampling_rate must be > 0")
+        self.annotation_path = str(annotation_path)
+        self.audio_chunk_seconds = float(audio_chunk_seconds)
+        self.sampling_rate = int(sampling_rate)
+        self.chunk_samples = int(round(self.audio_chunk_seconds * self.sampling_rate))
+        if self.chunk_samples <= 0:
+            raise ValueError("audio chunk duration rounds to zero samples")
+        self.pyarrow_site_packages = str(pyarrow_site_packages or "")
+        self.parquet_filename_prefix = str(parquet_filename_prefix or "")
+        self.parquet_paths = _discover_parquet_files(
+            annotation_path,
+            self.parquet_filename_prefix,
+        )
+        self._pq = _import_pyarrow_parquet(self.pyarrow_site_packages)
+        self._parquet_cache: Dict[str, Any] = {}
+        self._cache_pid = os.getpid()
+
+        dialog_rows: Dict[str, List[Dict[str, Any]]] = {}
+        dialog_order: List[str] = []
+        source_rows = 0
+        for file_index, parquet_path in enumerate(self.parquet_paths):
+            parquet_file = self._pq.ParquetFile(parquet_path)
+            available = set(parquet_file.schema_arrow.names)
+            missing = set(self.INDEX_COLUMNS) - available
+            if "audio" not in available:
+                missing.add("audio")
+            if missing:
+                raise ValueError(f"{parquet_path} is missing SpokenWOZ columns: {sorted(missing)}")
+            for row_group in range(parquet_file.num_row_groups):
+                table = parquet_file.read_row_group(row_group, columns=list(self.INDEX_COLUMNS))
+                for row_in_group, row in enumerate(table.to_pylist()):
+                    wav_id = str(row.get("wav_id") or "").strip()
+                    if not wav_id:
+                        raise ValueError(f"empty wav_id at {parquet_path} row group {row_group}:{row_in_group}")
+                    if wav_id not in dialog_rows:
+                        dialog_rows[wav_id] = []
+                        dialog_order.append(wav_id)
+                    row["path"] = str(parquet_path)
+                    row["file_index"] = file_index
+                    row["row_group"] = row_group
+                    row["row_in_group"] = row_in_group
+                    row["source_order"] = source_rows
+                    dialog_rows[wav_id].append(row)
+                    source_rows += 1
+
+        self.dialog_ids = dialog_order
+        self.dialog_rows = dialog_rows
+        for wav_id, rows in self.dialog_rows.items():
+            rows.sort(
+                key=lambda row: (
+                    int(row.get("turn_index") or 0),
+                    int(row["file_index"]),
+                    int(row["source_order"]),
+                )
+            )
+        self.source_row_count = source_rows
+
+    def __len__(self) -> int:
+        return len(self.dialog_ids)
+
+    def __getstate__(self) -> Dict[str, Any]:
+        state = dict(self.__dict__)
+        state["_pq"] = None
+        state["_parquet_cache"] = {}
+        state["_cache_pid"] = None
+        return state
+
+    def _parquet_file(self, path: str) -> Any:
+        current_pid = os.getpid()
+        if self._cache_pid != current_pid:
+            self._pq = None
+            self._parquet_cache = {}
+            self._cache_pid = current_pid
+        if self._pq is None:
+            self._pq = _import_pyarrow_parquet(self.pyarrow_site_packages)
+        if path not in self._parquet_cache:
+            self._parquet_cache[path] = self._pq.ParquetFile(path)
+        return self._parquet_cache[path]
+
+    def _read_dialog_audio(self, refs: Sequence[Dict[str, Any]]) -> List[Any]:
+        group_cache: Dict[Tuple[str, int], Any] = {}
+        audio_rows: List[Any] = []
+        for ref in refs:
+            key = (str(ref["path"]), int(ref["row_group"]))
+            if key not in group_cache:
+                group_cache[key] = self._parquet_file(key[0]).read_row_group(key[1], columns=["audio"])
+            table = group_cache[key]
+            audio_rows.append(table.column("audio")[int(ref["row_in_group"])].as_py())
+        return audio_rows
+
+    def __getitem__(self, index: int) -> Dict[str, Any]:
+        wav_id = self.dialog_ids[index]
+        refs = self.dialog_rows[wav_id]
+        audio_rows = self._read_dialog_audio(refs)
+        turns: List[Dict[str, Any]] = []
+        dialog_domains: set[str] = set()
+        latest_slots: Dict[str, Any] = {}
+        stream_elapsed = 0.0
+
+        for source_turn_number, (ref, audio_row) in enumerate(zip(refs, audio_rows)):
+            waveform = _decode_pcm_wav(audio_row, self.sampling_rate)
+            original_samples = len(waveform)
+            num_chunks = max(1, math.ceil(original_samples / self.chunk_samples))
+            domains = _parse_literal_metadata(ref.get("domains"), [])
+            slots = _parse_literal_metadata(ref.get("slots"), {})
+            dialog_domains.update(str(domain) for domain in domains)
+            if slots:
+                latest_slots = slots
+            source_turn_index = int(ref.get("turn_index") or 0)
+
+            for chunk_index in range(num_chunks):
+                start = chunk_index * self.chunk_samples
+                end = min(start + self.chunk_samples, original_samples)
+                valid_samples = max(0, end - start)
+                chunk = np.zeros(self.chunk_samples, dtype=np.float32)
+                if valid_samples:
+                    chunk[:valid_samples] = waveform[start:end]
+                is_final = chunk_index == num_chunks - 1
+                action = "speak" if is_final else "listen"
+                assistant_content = (
+                    "<|speak|>" + str(ref.get("agent_text") or "").strip()
+                    if is_final
+                    else "<|listen|>"
+                )
+                stream_elapsed += self.audio_chunk_seconds
+                turns.append(
+                    {
+                        "id": f"{wav_id}:turn{source_turn_index}:audio{chunk_index}",
+                        "turn_index": len(turns),
+                        "source_turn_index": source_turn_index,
+                        "source_turn_number": source_turn_number,
+                        "audio_chunk_index": chunk_index,
+                        "audio_chunk_count": num_chunks,
+                        "valid_audio_samples": valid_samples,
+                        "padded_audio_samples": self.chunk_samples - valid_samples,
+                        "is_final_audio_chunk": is_final,
+                        "target_time": stream_elapsed,
+                        "action": action,
+                        "user_content": [chunk],
+                        "assistant_content": assistant_content,
+                        "transcript": str(ref.get("text") or ""),
+                        "agent_text": str(ref.get("agent_text") or ""),
+                        "domains": domains,
+                        "slots": slots,
+                    }
+                )
+
+        return {
+            "id": wav_id,
+            "source": self.annotation_path,
+            "task_type": "spokenwoz",
+            "wav_id": wav_id,
+            "source_turn_count": len(refs),
+            "domains": sorted(dialog_domains),
+            "slots": latest_slots,
+            "turns": turns,
+        }
+
+
 def split_content_for_processor(content: Sequence[Any]) -> Tuple[str, List[Image.Image], List[np.ndarray], List[int]]:
     images: List[Image.Image] = []
     audios: List[np.ndarray] = []
@@ -1726,30 +2027,34 @@ class MiniCPMODataCollator:
         self,
         texts: Sequence[str],
         images_list: Sequence[List[Image.Image]],
+        audios_list: Optional[Sequence[List[np.ndarray]]] = None,
+        audio_parts: Optional[List[List[int]]] = None,
         *,
         max_length: Optional[int] = None,
     ) -> Dict[str, Any]:
         images_list = self._resize_images(images_list)
+        if audios_list is None:
+            audios_list = [[] for _ in texts]
         image_inputs = self.processor.process_image(
             images=list(images_list),
             do_pad=True,
             max_slice_nums=self.max_slice_nums,
             return_tensors="pt",
         )
+        audio_features, audio_feature_lens, audio_phs = self.processor.audio_feature_extract(
+            list(audios_list),
+            audio_parts,
+            self.stream_input,
+            self.sampling_rate,
+        )
         full_inputs = convert_omni_to_inputs_keep_listen(
             self.processor,
             image_inputs,
-            None,
+            audio_phs,
             texts,
             max_slice_nums=self.max_slice_nums,
             use_image_id=self.use_image_id,
             max_length=self.max_length if max_length is None else max_length,
-        )
-        audio_features, audio_feature_lens, _audio_phs = self.processor.audio_feature_extract(
-            [[] for _ in texts],
-            None,
-            self.stream_input,
-            self.sampling_rate,
         )
         full_inputs["audio_features"] = audio_features
         full_inputs["audio_feature_lens"] = audio_feature_lens
@@ -1759,12 +2064,14 @@ class MiniCPMODataCollator:
         self,
         text: str,
         image_sizes: Sequence[Any],
+        audio_placeholders: Optional[Sequence[str]] = None,
         *,
         max_length: Optional[int] = None,
     ) -> int:
         split_pattern = f"({re.escape(IMAGE_PATTERN)}|{re.escape(AUDIO_PATTERN)})"
         chunks = re.split(split_pattern, text)
         image_id = 0
+        audio_id = 0
         for chunk_idx, chunk in enumerate(chunks):
             if chunk == IMAGE_PATTERN:
                 chunks[chunk_idx] = self.processor.image_processor.get_slice_image_placeholder(
@@ -1775,7 +2082,10 @@ class MiniCPMODataCollator:
                 )
                 image_id += 1
             elif chunk == AUDIO_PATTERN:
-                raise NotImplementedError("Trajectory length calculation currently supports image/text turns only.")
+                if audio_placeholders is None or audio_id >= len(audio_placeholders):
+                    raise ValueError("audio placeholder metadata is required for audio length calculation")
+                chunks[chunk_idx] = audio_placeholders[audio_id]
+                audio_id += 1
         ids = self.tokenizer.encode("".join(chunks))
         if max_length is not None:
             ids = ids[:max_length]
@@ -2116,13 +2426,10 @@ class MiniCPMODuplexTrajectoryCollator(MiniCPMODataCollator):
         # This is the exact text layout used by MiniCPMODuplex.prepare().
         return f"<|im_start|>system\n{self.system_prompt}<|im_end|>"
 
-    def _duplex_unit_text(self, turn: Dict[str, Any]) -> Tuple[str, List[Image.Image]]:
+    def _duplex_unit_text(
+        self, turn: Dict[str, Any]
+    ) -> Tuple[str, List[Image.Image], List[np.ndarray]]:
         user_text, images, audios, _audio_parts = split_content_for_processor(turn["user_content"])
-        if audios:
-            raise NotImplementedError(
-                "Duplex trajectory collation currently supports image/text units only; "
-                "streaming audio needs chunk-exact feature extraction matching MiniCPMODuplex."
-            )
 
         # streaming_prefill feeds modalities in image -> audio -> text order.
         user_text = user_text.replace(IMAGE_PATTERN, "").replace(AUDIO_PATTERN, "")
@@ -2130,6 +2437,7 @@ class MiniCPMODuplexTrajectoryCollator(MiniCPMODataCollator):
             user_text = GENERATED_TIME_LINE_RE.sub("", user_text)
         user_text = user_text.strip()
         prefill_text = IMAGE_PATTERN * len(images)
+        prefill_text += AUDIO_PATTERN * len(audios)
         if user_text:
             prefill_text += user_text
 
@@ -2148,27 +2456,37 @@ class MiniCPMODuplexTrajectoryCollator(MiniCPMODataCollator):
         else:
             raise ValueError(f"Unsupported duplex action {action!r} in turn {turn.get('id')!r}")
 
-        return f"<unit>{prefill_text}{target_text}</unit>", images
+        return f"<unit>{prefill_text}{target_text}</unit>", images, audios
 
     def _duplex_texts_and_media(
         self,
         features: Sequence[Dict[str, Any]],
-    ) -> Tuple[List[str], List[List[Image.Image]]]:
+    ) -> Tuple[List[str], List[List[Image.Image]], List[List[np.ndarray]], List[List[int]]]:
         texts: List[str] = []
         images_list: List[List[Image.Image]] = []
+        audios_list: List[List[np.ndarray]] = []
+        audio_parts_list: List[List[int]] = []
         system_prefix = self._duplex_system_prefix()
         for feature in features:
             if "turns" not in feature:
                 raise ValueError("MiniCPMODuplexTrajectoryCollator requires trajectory features with 'turns'")
             unit_texts: List[str] = []
             sample_images: List[Image.Image] = []
+            sample_audios: List[np.ndarray] = []
             for turn in feature["turns"]:
-                unit_text, unit_images = self._duplex_unit_text(turn)
+                unit_text, unit_images, unit_audios = self._duplex_unit_text(turn)
                 unit_texts.append(unit_text)
                 sample_images.extend(unit_images)
+                sample_audios.extend(unit_audios)
             texts.append(system_prefix + "".join(unit_texts))
             images_list.append(sample_images)
-        return texts, images_list
+            audios_list.append(sample_audios)
+            # Duplex inference keeps one streaming audio-encoder context across
+            # units.  Mark all chunks as one part so offline training applies
+            # the model's 1-second chunk-attention mask over the continuous
+            # stream.  The processor still emits one placeholder per unit.
+            audio_parts_list.append([0] * len(sample_audios))
+        return texts, images_list, audios_list, audio_parts_list
 
     @staticmethod
     def _find_token(ids: Sequence[int], token_id: int, start: int, end: int) -> int:
@@ -2190,8 +2508,13 @@ class MiniCPMODuplexTrajectoryCollator(MiniCPMODataCollator):
     def __call__(self, features: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         import torch
 
-        full_texts, full_images_list = self._duplex_texts_and_media(features)
-        full_inputs = self._texts_to_inputs(full_texts, full_images_list)
+        full_texts, full_images_list, full_audios_list, audio_parts_list = self._duplex_texts_and_media(features)
+        full_inputs = self._texts_to_inputs(
+            full_texts,
+            full_images_list,
+            full_audios_list,
+            audio_parts_list,
+        )
         input_ids = full_inputs["input_ids"]
         labels = torch.full_like(input_ids, IGNORE_INDEX, dtype=torch.int64)
         loss_weights = torch.ones_like(input_ids, dtype=torch.float32)
@@ -2205,7 +2528,18 @@ class MiniCPMODuplexTrajectoryCollator(MiniCPMODataCollator):
             pad = seq_len - unpadded_len
             ids = [int(x) for x in input_ids[row_idx, pad : pad + unpadded_len].tolist()]
             image_sizes = full_inputs["image_sizes"][row_idx]
-            raw_full_len = self._text_to_input_length(full_texts[row_idx], image_sizes)
+            audio_placeholders = [
+                self.processor.get_audio_placeholder(
+                    len(audio),
+                    chunk_input=self.stream_input,
+                )
+                for audio in full_audios_list[row_idx]
+            ]
+            raw_full_len = self._text_to_input_length(
+                full_texts[row_idx],
+                image_sizes,
+                audio_placeholders,
+            )
             sequence_truncated = self.max_length is not None and raw_full_len > int(self.max_length)
             search_pos = 0
 
@@ -2226,14 +2560,22 @@ class MiniCPMODuplexTrajectoryCollator(MiniCPMODataCollator):
                 target_complete = True
                 if action == "listen":
                     target_input_end = action_input_pos + 1
+                    model_text_label_start = -1
+                    model_text_label_end = -1
                 else:
                     turn_eos_pos = self._find_token(ids, self.turn_eos_id, action_input_pos + 1, scan_end)
                     chunk_eos_pos = self._find_token(ids, self.chunk_eos_id, action_input_pos + 1, scan_end)
                     if turn_eos_pos < 0 or chunk_eos_pos != turn_eos_pos + 1:
                         target_input_end = scan_end
                         target_complete = False
+                        response_input_end = target_input_end
                     else:
                         target_input_end = chunk_eos_pos + 1
+                        response_input_end = turn_eos_pos
+                    # The logit at action_input_pos predicts the first text
+                    # token after <|speak|>. Exclude turn/chunk terminators.
+                    model_text_label_start = pad + action_input_pos
+                    model_text_label_end = pad + max(action_input_pos, response_input_end - 1)
 
                 # Pre-shift labels because train_text_policy_fsdp._weighted_ce_loss
                 # compares logits and labels at the same positions without shifting.
@@ -2288,6 +2630,15 @@ class MiniCPMODuplexTrajectoryCollator(MiniCPMODataCollator):
                         "target_time": turn.get("target_time"),
                         "gold_action": action,
                         "gold_text": turn.get("assistant_content"),
+                        "model_text_label_start": model_text_label_start,
+                        "model_text_label_end": model_text_label_end,
+                        "source_turn_index": turn.get("source_turn_index"),
+                        "audio_chunk_index": turn.get("audio_chunk_index"),
+                        "audio_chunk_count": turn.get("audio_chunk_count"),
+                        "valid_audio_samples": turn.get("valid_audio_samples"),
+                        "padded_audio_samples": turn.get("padded_audio_samples"),
+                        "domains": turn.get("domains"),
+                        "slots": turn.get("slots"),
                         "speak_segment_start": segment_start,
                         "speak_segment_end": segment_end,
                         "speak_segment_text": turn.get("speak_segment_text"),
